@@ -1,0 +1,71 @@
+# Training outputs and checkpoints
+training_outputs/
+best_landmark_gesture_classifier.pt
+best_landmark_gesture_classifier_macro_f1.pt
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# OpenPose build artifacts and downloaded model weights
+src/external/openpose/build/
+src/external/openpose/models/
+
+# MediaPipe model weights
+src/model/mediapipe_models/
+
+# Debug / sample extraction outputs
+src/model/openpose_single_frame_output/
+src/gesture_desc/samples/
+src/pre_process/sample_eaf.txt
+
+# Large data and media files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4v
+*.wav
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.caffemodel
+*.task
+*.onnx
+*.bin
+*.binaryproto
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Environments and secrets
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Logs and experiment tracking
+*.log
+wandb/
+runs/
+tensorboard/
+lightning_logs/
