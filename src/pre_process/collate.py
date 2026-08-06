@@ -166,6 +166,8 @@ def gesture_segment_collate_fn(batch: list[dict]) -> dict:
     Each sample is expected to have:
         {
             "landmarks": torch.Tensor [T, J, C] or numpy.ndarray [T, J, C],
+            "transcript_chunks": list[str] (optional),
+            "transcript_chunk_mask": torch.BoolTensor [N] (optional),
             "transcript": str (optional),
             "gesture_type": str,
             "annotation": dict (optional),
@@ -213,6 +215,32 @@ def gesture_segment_collate_fn(batch: list[dict]) -> dict:
 
     padded_landmarks, landmark_mask, lengths = _pad_landmark_batch(landmarks_list)
     transcripts = [str(sample.get("transcript", "")) for sample in batch]
+    transcript_chunks = [list(sample.get("transcript_chunks", [])) for sample in batch]
+    chunk_masks = [sample.get("transcript_chunk_mask") for sample in batch]
+
+    if any(mask is not None for mask in chunk_masks):
+        if not all(mask is not None for mask in chunk_masks):
+            raise ValueError(
+                "All samples in a batch must provide transcript_chunk_mask when "
+                "transcript chunks are used."
+            )
+        num_chunks = chunk_masks[0].shape[0]
+        for sample_chunks, sample_mask in zip(transcript_chunks, chunk_masks):
+            if len(sample_chunks) != num_chunks:
+                raise ValueError(
+                    "All transcript_chunks in a batch must have the same length "
+                    f"({num_chunks}), got {len(sample_chunks)}."
+                )
+            if int(sample_mask.shape[0]) != num_chunks:
+                raise ValueError(
+                    "transcript_chunk_mask length must match transcript_chunks."
+                )
+        transcript_chunk_mask = torch.stack(
+            [mask.to(dtype=torch.bool) for mask in chunk_masks],
+            dim=0,
+        )
+    else:
+        transcript_chunk_mask = None
 
     return {
         "landmarks": padded_landmarks,
@@ -222,6 +250,8 @@ def gesture_segment_collate_fn(batch: list[dict]) -> dict:
             dtype=torch.long,
         ),
         "transcripts": transcripts,
+        "transcript_chunks": transcript_chunks,
+        "transcript_chunk_mask": transcript_chunk_mask,
         "gesture_types": gesture_types,
         "annotations": annotations,
         "lengths": lengths,

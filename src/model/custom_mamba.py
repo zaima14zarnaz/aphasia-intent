@@ -10,6 +10,7 @@ kinematic embeddings (position, velocity, acceleration).
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Iterable, Sequence
 
@@ -47,6 +48,11 @@ __all__ = [
 DEFAULT_BERT_MODEL_NAME = "bert-base-uncased"
 DEFAULT_TRANSCRIPT_EMBED_DIM = 256
 DEFAULT_BERT_MAX_LENGTH = 128
+DEFAULT_NUM_TRANSCRIPT_CHUNKS = 5
+DEFAULT_MAX_TRANSCRIPT_CHUNKS = 16
+DEFAULT_TRANSCRIPT_DROPOUT_PROBABILITY = 0.2
+INITIAL_GATE = 0.2
+INITIAL_GATE_LOGIT = math.log(INITIAL_GATE / (1.0 - INITIAL_GATE))
 
 DEFAULT_NORMALIZATION_EPS = 1e-6
 DEFAULT_TEMPORAL_EMBED_DIM = 1024
@@ -825,6 +831,35 @@ class TranscriptBERTEncoder(nn.Module):
         cls_embedding = outputs.last_hidden_state[:, 0, :]
         return self.proj(cls_embedding)
 
+    def encode_chunks(
+        self,
+        transcript_chunks: Sequence[Sequence[str]],
+    ) -> torch.Tensor:
+        """Encode per-sample transcript chunks to ``[B, N, output_dim]``."""
+        if not transcript_chunks:
+            raise ValueError("transcript_chunks must contain at least one sample.")
+
+        batch_size = len(transcript_chunks)
+        num_chunks = len(transcript_chunks[0])
+        if num_chunks <= 0:
+            raise ValueError("Each sample must contain at least one transcript chunk.")
+
+        for sample_index, sample_chunks in enumerate(transcript_chunks):
+            if len(sample_chunks) != num_chunks:
+                raise ValueError(
+                    "All samples must provide the same number of transcript chunks; "
+                    f"sample 0 has {num_chunks}, sample {sample_index} has "
+                    f"{len(sample_chunks)}."
+                )
+
+        flat_chunks = [
+            str(chunk_text)
+            for sample_chunks in transcript_chunks
+            for chunk_text in sample_chunks
+        ]
+        flat_embeddings = self.forward(flat_chunks)
+        return flat_embeddings.view(batch_size, num_chunks, self.output_dim)
+
 
 class LandmarkGestureClassifier(nn.Module):
     """
@@ -845,11 +880,14 @@ class LandmarkGestureClassifier(nn.Module):
         -> edge-aware GCN stack ``[B, T, J, gcn_dim]``
         -> frame joint pooling / temporal pooling / classifier
 
-    Pipeline (``use_mamba_encoder=True``):
-        ... spatial encoding (GCN or kinematic) + frame pooling ...
-        -> temporal projection ``[B, T, temporal_embed_dim]``
+    Pipeline (``use_mamba_encoder=True``, ``use_transcripts=True``):
+        raw landmarks -> canonical ``[B, T, J, C]``
+        -> spatial encoding (GCN or kinematic) + frame pooling ``[B, T, gcn_dim]``
+        -> pose projection ``[B, T, hidden_dim]``
+        -> BERT chunk encoding + soft pose-to-chunk attention
+        -> gated residual fusion ``[B, T, hidden_dim]``
         -> bidirectional Mamba temporal encoder
-        -> temporal attention pooling ``[B, temporal_embed_dim]``
+        -> temporal attention pooling ``[B, hidden_dim]``
         -> logits ``[B, num_classes]``
     """
 
@@ -897,6 +935,9 @@ class LandmarkGestureClassifier(nn.Module):
         transcript_embed_dim: int = DEFAULT_TRANSCRIPT_EMBED_DIM,
         freeze_bert: bool = False,
         bert_max_length: int = DEFAULT_BERT_MAX_LENGTH,
+        num_transcript_chunks: int = DEFAULT_NUM_TRANSCRIPT_CHUNKS,
+        max_transcript_chunks: int = DEFAULT_MAX_TRANSCRIPT_CHUNKS,
+        transcript_dropout_probability: float = DEFAULT_TRANSCRIPT_DROPOUT_PROBABILITY,
     ) -> None:
         super().__init__()
 
@@ -927,6 +968,24 @@ class LandmarkGestureClassifier(nn.Module):
             )
         if bert_max_length <= 0:
             raise ValueError(f"bert_max_length must be positive, got {bert_max_length}")
+        if num_transcript_chunks <= 0:
+            raise ValueError(
+                f"num_transcript_chunks must be positive, got {num_transcript_chunks}"
+            )
+        if max_transcript_chunks <= 0:
+            raise ValueError(
+                f"max_transcript_chunks must be positive, got {max_transcript_chunks}"
+            )
+        if num_transcript_chunks > max_transcript_chunks:
+            raise ValueError(
+                "num_transcript_chunks must not exceed max_transcript_chunks: "
+                f"{num_transcript_chunks} > {max_transcript_chunks}"
+            )
+        if not 0.0 <= transcript_dropout_probability <= 1.0:
+            raise ValueError(
+                "transcript_dropout_probability must be in [0, 1], got "
+                f"{transcript_dropout_probability}"
+            )
         if frame_pool_type not in {"attention", "mean"}:
             raise ValueError(
                 f"frame_pool_type must be 'attention' or 'mean', got {frame_pool_type!r}"
@@ -971,10 +1030,20 @@ class LandmarkGestureClassifier(nn.Module):
         self.use_mamba_encoder = use_mamba_encoder
         self.use_transcripts = use_transcripts
         self.transcript_embed_dim = transcript_embed_dim if use_transcripts else 0
+        self.num_transcript_chunks = num_transcript_chunks if use_transcripts else 0
+        self.max_transcript_chunks = max_transcript_chunks if use_transcripts else 0
+        self.transcript_dropout_probability = transcript_dropout_probability
         self.use_temporal_attention_pool = use_temporal_attention_pool
         self.classifier_dim = temporal_embed_dim
         self.kinematic_feature_dim = KINEMATIC_FEATURE_DIM
-        frame_token_dim = gcn_dim + self.transcript_embed_dim
+        hidden_dim = temporal_embed_dim
+
+        self.pose_feature_proj = nn.Sequential(
+            nn.LayerNorm(gcn_dim),
+            nn.Linear(gcn_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
 
         self.preprocessor = PoseFeaturePreprocessor(
             num_joints=num_joints,
@@ -1024,17 +1093,33 @@ class LandmarkGestureClassifier(nn.Module):
                 freeze_bert=freeze_bert,
                 max_length=bert_max_length,
             )
-        else:
-            self.transcript_encoder = None
-
-        if use_mamba_encoder:
-            self.gcn_sample_proj = None
-            self.temporal_proj = nn.Sequential(
-                nn.LayerNorm(frame_token_dim),
-                nn.Linear(frame_token_dim, temporal_embed_dim),
+            self.text_value_projection = nn.Linear(transcript_embed_dim, hidden_dim)
+            self.text_key_projection = nn.Linear(transcript_embed_dim, hidden_dim)
+            self.pose_query_projection = nn.Linear(hidden_dim, hidden_dim)
+            self.chunk_position_embedding = nn.Parameter(
+                torch.zeros(1, max_transcript_chunks, hidden_dim)
+            )
+            self.text_context_projection = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
             )
+            self.gate_projection = nn.Linear(hidden_dim * 2, hidden_dim)
+            nn.init.zeros_(self.gate_projection.weight)
+            nn.init.constant_(self.gate_projection.bias, INITIAL_GATE_LOGIT)
+        else:
+            self.transcript_encoder = None
+            self.text_value_projection = None
+            self.text_key_projection = None
+            self.pose_query_projection = None
+            self.chunk_position_embedding = None
+            self.text_context_projection = None
+            self.gate_projection = None
+
+        if use_mamba_encoder:
+            self.gcn_sample_proj = None
+            self.temporal_proj = None
             self.temporal_encoder = MambaTemporalEncoder(
                 d_model=temporal_embed_dim,
                 num_layers=encoder_depth,
@@ -1065,12 +1150,12 @@ class LandmarkGestureClassifier(nn.Module):
             self.temporal_proj = None
             self.temporal_encoder = None
             self.gcn_sample_proj = nn.Sequential(
-                nn.LayerNorm(frame_token_dim),
-                nn.Linear(frame_token_dim, temporal_embed_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, temporal_embed_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
             )
-            pool_dim = frame_token_dim
+            pool_dim = temporal_embed_dim
 
         self.sample_pool = (
             TemporalAttentionPool(pool_dim)
@@ -1123,58 +1208,173 @@ class LandmarkGestureClassifier(nn.Module):
             spatial = self.kinematic_proj(kinematic)
         return self.frame_joint_pool(spatial)
 
-    def _fuse_transcript_tokens(
-        self,
-        frame_tokens: torch.Tensor,
-        transcripts: Sequence[str] | None,
-    ) -> torch.Tensor:
-        """Concatenate BERT transcript embeddings onto frame tokens."""
-        if not self.use_transcripts or self.transcript_encoder is None:
-            return frame_tokens
+    def _encode_pose_features(self, landmarks: torch.Tensor) -> torch.Tensor:
+        """Return pose sequence features with shape ``[B, T, hidden_dim]``."""
+        frame_tokens = self._encode_frame_tokens(landmarks)
+        return self.pose_feature_proj(frame_tokens)
 
-        batch_size = frame_tokens.shape[0]
-        if transcripts is None:
-            transcript_emb = frame_tokens.new_zeros(
+    def _apply_modality_dropout(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return a per-sample keep mask with shape ``[B, 1, 1]``."""
+        if (
+            not self.training
+            or not self.use_transcripts
+            or self.transcript_dropout_probability <= 0.0
+        ):
+            return torch.ones(batch_size, 1, 1, device=device, dtype=dtype)
+
+        keep_mask = torch.rand(batch_size, device=device, dtype=dtype)
+        keep_mask = (keep_mask >= self.transcript_dropout_probability).to(dtype)
+        return keep_mask.view(batch_size, 1, 1)
+
+    def _fuse_pose_transcript_chunks(
+        self,
+        pose_features: torch.Tensor,
+        transcript_chunks: Sequence[Sequence[str]] | None,
+        transcript_chunk_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """
+        Soft-align transcript chunks to pose timesteps and fuse with a gated residual.
+
+        Returns:
+            fused_pose: ``[B, T, hidden_dim]``
+            attention_weights: ``[B, T, N]`` or ``None``
+            modality_gate: ``[B, T, hidden_dim]`` or ``None``
+            chunk_mask: ``[B, N]`` or ``None``
+        """
+        if not self.use_transcripts or self.transcript_encoder is None:
+            return pose_features, None, None, None
+
+        batch_size, num_frames, hidden_dim = pose_features.shape
+        attention_weights: torch.Tensor | None = None
+        modality_gate: torch.Tensor | None = None
+        chunk_mask = transcript_chunk_mask
+
+        if transcript_chunks is None:
+            return pose_features, None, None, chunk_mask
+
+        if len(transcript_chunks) != batch_size:
+            raise ValueError(
+                "Expected one transcript-chunk list per batch item, got "
+                f"{len(transcript_chunks)} lists for batch_size={batch_size}."
+            )
+
+        num_chunks = len(transcript_chunks[0])
+        if num_chunks != self.num_transcript_chunks:
+            raise ValueError(
+                "Expected transcript chunks with length "
+                f"{self.num_transcript_chunks}, got {num_chunks}."
+            )
+        if num_chunks > self.max_transcript_chunks:
+            raise ValueError(
+                f"num_transcript_chunks={num_chunks} exceeds configured "
+                f"max_transcript_chunks={self.max_transcript_chunks}."
+            )
+
+        chunk_embeddings = self.transcript_encoder.encode_chunks(transcript_chunks)
+        assert chunk_embeddings.shape == (
+            batch_size,
+            num_chunks,
+            self.transcript_embed_dim,
+        )
+
+        chunk_values = self.text_value_projection(chunk_embeddings)
+        chunk_keys = self.text_key_projection(chunk_embeddings)
+        position_embedding = self.chunk_position_embedding[:, :num_chunks, :]
+        chunk_values = chunk_values + position_embedding
+        chunk_keys = chunk_keys + position_embedding
+
+        queries = self.pose_query_projection(pose_features)
+        attention_logits = torch.matmul(
+            queries,
+            chunk_keys.transpose(-1, -2),
+        ) / math.sqrt(hidden_dim)
+
+        if transcript_chunk_mask is None:
+            chunk_mask = torch.ones(
                 batch_size,
-                self.transcript_embed_dim,
+                num_chunks,
+                dtype=torch.bool,
+                device=pose_features.device,
             )
         else:
-            if len(transcripts) != batch_size:
+            if transcript_chunk_mask.shape != (batch_size, num_chunks):
                 raise ValueError(
-                    "Expected one transcript per batch item, got "
-                    f"{len(transcripts)} transcripts for batch_size={batch_size}."
+                    "transcript_chunk_mask must have shape "
+                    f"[{batch_size}, {num_chunks}], got "
+                    f"{tuple(transcript_chunk_mask.shape)}."
                 )
-            transcript_emb = self.transcript_encoder(list(transcripts))
+            chunk_mask = transcript_chunk_mask.to(
+                device=pose_features.device,
+                dtype=torch.bool,
+            )
 
-        transcript_tokens = transcript_emb.unsqueeze(1).expand(
-            -1,
-            frame_tokens.shape[1],
-            -1,
+        valid_chunks = chunk_mask.unsqueeze(1)
+        attention_logits = attention_logits.masked_fill(~valid_chunks, float("-inf"))
+        sample_has_valid_chunks = valid_chunks.any(dim=-1, keepdim=True)
+
+        attention_weights = torch.softmax(attention_logits, dim=-1)
+        attention_weights = torch.where(
+            sample_has_valid_chunks,
+            attention_weights,
+            torch.zeros_like(attention_weights),
         )
-        return torch.cat([frame_tokens, transcript_tokens], dim=-1)
+        attention_weights = torch.nan_to_num(attention_weights, nan=0.0)
+
+        text_context = torch.matmul(attention_weights, chunk_values)
+
+        gate_input = torch.cat([pose_features, text_context], dim=-1)
+        modality_gate = torch.sigmoid(self.gate_projection(gate_input))
+
+        transcript_active = sample_has_valid_chunks.to(dtype=pose_features.dtype)
+        modality_keep = self._apply_modality_dropout(
+            batch_size,
+            device=pose_features.device,
+            dtype=pose_features.dtype,
+        )
+        effective_gate = modality_gate * transcript_active * modality_keep
+
+        if not sample_has_valid_chunks.all():
+            text_context = text_context * transcript_active
+
+        fused_pose = pose_features + effective_gate * self.text_context_projection(
+            text_context
+        )
+        assert fused_pose.shape == pose_features.shape
+        return fused_pose, attention_weights, modality_gate, chunk_mask
 
     def encode_temporal(
         self,
         landmarks: torch.Tensor,
         *,
+        transcript_chunks: Sequence[Sequence[str]] | None = None,
+        transcript_chunk_mask: torch.Tensor | None = None,
         transcripts: Sequence[str] | None = None,
     ) -> torch.Tensor:
         """Return the sample-level embedding ``[B, temporal_embed_dim]``."""
-        frame_tokens = self._encode_frame_tokens(landmarks)
-        frame_tokens = self._fuse_transcript_tokens(frame_tokens, transcripts)
+        _ = transcripts
+        pose_features = self._encode_pose_features(landmarks)
+        fused_pose, _, _, _ = self._fuse_pose_transcript_chunks(
+            pose_features,
+            transcript_chunks,
+            transcript_chunk_mask,
+        )
 
         if self.use_mamba_encoder:
-            temporal_tokens = self.temporal_proj(frame_tokens)
-            encoded = self.temporal_encoder(temporal_tokens)
+            encoded = self.temporal_encoder(fused_pose)
             if self.sample_pool is not None:
                 sample_embedding = self.sample_pool(encoded)
             else:
                 sample_embedding = encoded.mean(dim=1)
         else:
             if self.sample_pool is not None:
-                pooled = self.sample_pool(frame_tokens)
+                pooled = self.sample_pool(fused_pose)
             else:
-                pooled = frame_tokens.mean(dim=1)
+                pooled = fused_pose.mean(dim=1)
             sample_embedding = self.gcn_sample_proj(pooled)
 
         if sample_embedding.shape[-1] != self.temporal_embed_dim:
@@ -1213,8 +1413,11 @@ class LandmarkGestureClassifier(nn.Module):
         self,
         landmarks: torch.Tensor,
         *,
+        transcript_chunks: Sequence[Sequence[str]] | None = None,
+        transcript_chunk_mask: torch.Tensor | None = None,
         transcripts: Sequence[str] | None = None,
-    ) -> torch.Tensor:
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Full gesture classification pipeline.
 
@@ -1223,8 +1426,8 @@ class LandmarkGestureClassifier(nn.Module):
             2. Normalize pose and build kinematic node features.
             3. Apply GCN spatial encoding when ``use_gcn=True``; otherwise embed
                position/velocity/acceleration directly.
-            4. Optionally encode segment transcripts with BERT and concatenate
-               them onto frame tokens before the temporal encoder.
+            4. Soft-align BERT-encoded transcript chunks to pose timesteps and
+               fuse them with a gated residual before the temporal encoder.
             5. Pool over joints/time and classify.
                When ``use_mamba_encoder=True``, run the Mamba temporal encoder
                before pooling.
@@ -1232,9 +1435,62 @@ class LandmarkGestureClassifier(nn.Module):
                Softmax is applied only for inference when
                ``return_probabilities=True`` and ``self.training`` is False.
         """
-        sample_embedding = self.encode_temporal(landmarks, transcripts=transcripts)
+        _ = transcripts
+        pose_features = self._encode_pose_features(landmarks)
+        fused_pose, attention_weights, modality_gate, chunk_mask = (
+            self._fuse_pose_transcript_chunks(
+                pose_features,
+                transcript_chunks,
+                transcript_chunk_mask,
+            )
+        )
+
+        if self.use_mamba_encoder:
+            encoded = self.temporal_encoder(fused_pose)
+            if self.sample_pool is not None:
+                sample_embedding = self.sample_pool(encoded)
+            else:
+                sample_embedding = encoded.mean(dim=1)
+        else:
+            if self.sample_pool is not None:
+                pooled = self.sample_pool(fused_pose)
+            else:
+                pooled = fused_pose.mean(dim=1)
+            sample_embedding = self.gcn_sample_proj(pooled)
+
         logits = self.classifier(sample_embedding)
         logits = _validate_logits(logits, num_classes=self.num_classes)
+
+        if return_attention:
+            if attention_weights is None:
+                batch_size = landmarks.shape[0]
+                num_chunks = self.num_transcript_chunks
+                attention_weights = landmarks.new_zeros(
+                    batch_size,
+                    self.num_frames,
+                    num_chunks,
+                )
+            if modality_gate is None:
+                modality_gate = landmarks.new_zeros(
+                    pose_features.shape[0],
+                    pose_features.shape[1],
+                    self.temporal_embed_dim,
+                )
+            if chunk_mask is None:
+                chunk_mask = torch.zeros(
+                    landmarks.shape[0],
+                    self.num_transcript_chunks,
+                    dtype=torch.bool,
+                    device=landmarks.device,
+                )
+            if self.return_probabilities:
+                if self.training:
+                    raise RuntimeError(
+                        "return_probabilities=True cannot be used while training. "
+                        "CrossEntropyLoss requires raw logits from the model."
+                    )
+                logits = F.softmax(logits, dim=-1)
+            return logits, attention_weights, modality_gate, chunk_mask
 
         if self.return_probabilities:
             if self.training:
@@ -1253,6 +1509,155 @@ def _assert_no_self_neighbors(neighbor_idx: torch.Tensor) -> None:
     center_idx = center_idx.view(1, 1, num_joints, 1)
     if bool((neighbor_idx == center_idx).any()):
         raise AssertionError("neighbor_idx must not contain self-neighbors")
+
+
+def _validate_chunk_alignment_model(
+    *,
+    batch_size: int = 2,
+    num_frames: int = 16,
+    num_joints: int = NUM_UPPER_BODY_LANDMARKS,
+    in_channels: int = 4,
+    num_classes: int = 2,
+    num_transcript_chunks: int = 5,
+    max_transcript_chunks: int = 16,
+) -> None:
+    """Validate soft pose-to-chunk alignment shapes, masking, and gradients."""
+    hidden_dim = 128
+    text_dim = 64
+    landmarks = torch.randn(batch_size, num_frames, num_joints, in_channels)
+
+    def _make_model(num_chunks: int) -> LandmarkGestureClassifier:
+        return LandmarkGestureClassifier(
+            num_classes=num_classes,
+            num_frames=num_frames,
+            num_joints=num_joints,
+            in_channels=in_channels,
+            temporal_embed_dim=hidden_dim,
+            embed_dim=64,
+            gcn_layers=2,
+            gcn_top_k=4,
+            use_gcn=True,
+            use_mamba_encoder=True,
+            mamba_layers=1,
+            use_transcripts=True,
+            transcript_embed_dim=text_dim,
+            num_transcript_chunks=num_chunks,
+            max_transcript_chunks=max_transcript_chunks,
+            transcript_dropout_probability=0.0,
+        )
+
+    model = _make_model(num_transcript_chunks)
+    model.eval()
+
+    transcript_chunks = [
+        [f"sample{b}_chunk{c}" for c in range(num_transcript_chunks)]
+        for b in range(batch_size)
+    ]
+    transcript_chunk_mask = torch.tensor(
+        [
+            [True, True, False, True, False],
+            [False, False, False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+
+    pose_features = model._encode_pose_features(landmarks)
+    assert pose_features.shape == (batch_size, num_frames, hidden_dim)
+
+    fused_pose, attention_weights, modality_gate, chunk_mask = (
+        model._fuse_pose_transcript_chunks(
+            pose_features,
+            transcript_chunks,
+            transcript_chunk_mask,
+        )
+    )
+    assert fused_pose.shape == pose_features.shape
+    assert attention_weights is not None
+    assert attention_weights.shape == (batch_size, num_frames, num_transcript_chunks)
+    assert chunk_mask is not None
+    assert chunk_mask.shape == (batch_size, num_transcript_chunks)
+    assert torch.isfinite(attention_weights).all()
+    assert torch.isfinite(fused_pose).all()
+
+    invalid_chunk_attention = attention_weights[:, :, ~transcript_chunk_mask.any(dim=0)]
+    if invalid_chunk_attention.numel() > 0:
+        assert torch.allclose(
+            invalid_chunk_attention,
+            torch.zeros_like(invalid_chunk_attention),
+        )
+
+    valid_rows = transcript_chunk_mask.any(dim=-1)
+    if bool(valid_rows.any()):
+        valid_attention = attention_weights[valid_rows]
+        valid_mask = transcript_chunk_mask[valid_rows]
+        summed = valid_attention.sum(dim=-1)
+        assert torch.allclose(
+            summed,
+            torch.ones_like(summed),
+            atol=1e-5,
+        )
+        masked_invalid = valid_attention.masked_select(~valid_mask.unsqueeze(1))
+        assert torch.allclose(masked_invalid, torch.zeros_like(masked_invalid))
+
+    empty_row = 1
+    assert torch.allclose(
+        attention_weights[empty_row],
+        torch.zeros_like(attention_weights[empty_row]),
+    )
+    assert torch.allclose(
+        fused_pose[empty_row],
+        pose_features[empty_row],
+        atol=1e-5,
+    )
+
+    initial_gate = torch.sigmoid(model.gate_projection.bias.detach())
+    assert torch.allclose(
+        initial_gate,
+        torch.full_like(initial_gate, INITIAL_GATE),
+        atol=1e-4,
+    )
+
+    logits, attn_out, gate_out, mask_out = model(
+        landmarks,
+        transcript_chunks=transcript_chunks,
+        transcript_chunk_mask=transcript_chunk_mask,
+        return_attention=True,
+    )
+    assert logits.shape == (batch_size, num_classes)
+    assert attn_out.shape == (batch_size, num_frames, num_transcript_chunks)
+    assert gate_out.shape == (batch_size, num_frames, hidden_dim)
+    assert mask_out.shape == (batch_size, num_transcript_chunks)
+    assert attn_out.requires_grad
+    assert gate_out.requires_grad
+
+    model.train()
+    model.transcript_dropout_probability = 0.0
+    logits = model(
+        landmarks,
+        transcript_chunks=transcript_chunks,
+        transcript_chunk_mask=transcript_chunk_mask,
+    )
+    loss = logits.sum()
+    loss.backward()
+    assert model.text_value_projection.weight.grad is not None
+    assert model.text_key_projection.weight.grad is not None
+    assert model.pose_query_projection.weight.grad is not None
+    assert model.gate_projection.weight.grad is not None
+    assert model.transcript_encoder.proj[1].weight.grad is not None
+
+    alt_num_chunks = 3
+    alt_model = _make_model(alt_num_chunks)
+    alt_chunks = [
+        [f"alt{b}_chunk{c}" for c in range(alt_num_chunks)]
+        for b in range(batch_size)
+    ]
+    alt_mask = torch.ones(batch_size, alt_num_chunks, dtype=torch.bool)
+    alt_logits = alt_model(
+        landmarks,
+        transcript_chunks=alt_chunks,
+        transcript_chunk_mask=alt_mask,
+    )
+    assert alt_logits.shape == (batch_size, num_classes)
 
 
 def _run_model_sanity_check(
@@ -1352,6 +1757,16 @@ def _main() -> None:
         num_joints=num_joints,
         in_channels=in_channels,
         num_classes=num_classes,
+    )
+
+    print("\n=== sanity check: chunk alignment ===")
+    _validate_chunk_alignment_model(
+        batch_size=batch_size,
+        num_frames=16,
+        num_joints=num_joints,
+        in_channels=in_channels,
+        num_classes=num_classes,
+        num_transcript_chunks=5,
     )
 
     model = LandmarkGestureClassifier(

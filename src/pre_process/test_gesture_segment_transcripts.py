@@ -21,10 +21,12 @@ from dataloder import (  # noqa: E402
     AphasiaGestureSegmentDataset,
     NEGATIVE_SEGMENT_LABEL,
     POSITIVE_SEGMENT_LABEL,
+    _build_transcript_chunks,
     _build_transcript_lookup,
     _parse_cha_media_reference,
     _scan_cha_transcript_files,
 )
+from collate import gesture_segment_collate_fn  # noqa: E402
 
 
 def _write_min_landmarks(path: Path) -> None:
@@ -173,8 +175,11 @@ def test_transcript_extraction_and_shapes(fixture: dict[str, Path]) -> None:
     assert sample["landmarks"].shape == (2, 25, 4)
     assert sample["label"] == POSITIVE_SEGMENT_LABEL
     assert sample["gesture_type"] == "POS"
+    assert len(sample["transcript_chunks"]) == dataset.num_transcript_chunks
+    assert sample["transcript_chunk_mask"].shape == (dataset.num_transcript_chunks,)
     assert "PAR:" in sample["transcript"]
     assert "INV:" not in sample["transcript"]
+    assert sample["transcript_chunk_mask"].any()
 
     neg_index = next(
         index
@@ -199,8 +204,8 @@ def test_no_overlap_returns_empty_transcript(fixture: dict[str, Path]) -> None:
         video_filename="68-2.mp4",
         segment_name="gest_0",
         label=POSITIVE_SEGMENT_LABEL,
-        start_ms=10000,
-        end_ms=11000,
+        start_ms=300000,
+        end_ms=301000,
     )
     _write_timed_cha(fixture["transcript_root"] / "68-2.cha", media_ref="68-2")
 
@@ -209,12 +214,7 @@ def test_no_overlap_returns_empty_transcript(fixture: dict[str, Path]) -> None:
         negative_landmarks_dir=fixture["negative_root"],
         transcript_dir=fixture["transcript_root"],
         strict_transcripts=False,
-        transcript_kwargs={
-            "context_before_ms": 0,
-            "context_after_ms": 0,
-            "min_utterances_before": 0,
-            "min_utterances_after": 0,
-        },
+        transcript_offset_seconds=3.0,
     )
 
     gap_index = next(
@@ -225,6 +225,39 @@ def test_no_overlap_returns_empty_transcript(fixture: dict[str, Path]) -> None:
     dataset.sample_indices = [gap_index]
     dataset.active_indices = [gap_index]
     assert dataset[0]["transcript"] == ""
+    assert len(dataset[0]["transcript_chunks"]) == dataset.num_transcript_chunks
+    assert not dataset[0]["transcript_chunk_mask"].any()
+
+
+def test_expanded_window_includes_nearby_transcript(fixture: dict[str, Path]) -> None:
+    _write_segment(
+        fixture["landmarks_root"],
+        video_filename="70-3.mp4",
+        segment_name="gest_0",
+        label=POSITIVE_SEGMENT_LABEL,
+        start_ms=10000,
+        end_ms=11000,
+    )
+    _write_timed_cha(fixture["transcript_root"] / "70-3.cha", media_ref="70-3")
+
+    dataset = AphasiaGestureSegmentDataset(
+        landmarks_dir=fixture["landmarks_root"],
+        negative_landmarks_dir=fixture["negative_root"],
+        transcript_dir=fixture["transcript_root"],
+        strict_transcripts=False,
+        transcript_offset_seconds=3.0,
+        num_transcript_chunks=3,
+    )
+    gap_index = next(
+        index
+        for index, item in enumerate(dataset.samples)
+        if item.video_filename == "70-3.mp4"
+    )
+    dataset.sample_indices = [gap_index]
+    dataset.active_indices = [gap_index]
+    sample = dataset[0]
+    assert "INV:" in sample["transcript"]
+    assert len(sample["transcript_chunks"]) == 3
 
 
 def test_non_strict_missing_transcript(fixture: dict[str, Path]) -> None:
@@ -336,6 +369,40 @@ def test_from_existing_preserves_transcript_state(fixture: dict[str, Path]) -> N
     assert view._transcript_cache is base._transcript_cache
     assert view._missing_transcript_warned is base._missing_transcript_warned
     assert view[0]["transcript"] == base[0]["transcript"]
+    assert view[0]["transcript_chunks"] == base[0]["transcript_chunks"]
+
+
+def test_transcript_chunk_partitioning() -> None:
+    lines = [
+        {"speaker": "PAR", "text": "early", "start_ts": 1000, "end_ts": 2000},
+        {"speaker": "PAR", "text": "middle", "start_ts": 2500, "end_ts": 3500},
+        {"speaker": "PAR", "text": "late", "start_ts": 8000, "end_ts": 9000},
+    ]
+    chunks, mask = _build_transcript_chunks(
+        lines,
+        window_start_ms=0,
+        window_end_ms=10000,
+        num_chunks=5,
+    )
+    assert len(chunks) == 5
+    assert mask.shape == (5,)
+    assert "early" in chunks[0]
+    assert "middle" in chunks[1] or "middle" in chunks[2]
+    assert "late" in chunks[-1]
+
+
+def test_variable_num_transcript_chunks(fixture: dict[str, Path]) -> None:
+    dataset = AphasiaGestureSegmentDataset(
+        landmarks_dir=fixture["landmarks_root"],
+        negative_landmarks_dir=fixture["negative_root"],
+        transcript_dir=fixture["transcript_root"],
+        strict_transcripts=False,
+        num_transcript_chunks=3,
+        return_tensor=True,
+    )
+    sample = dataset[0]
+    assert len(sample["transcript_chunks"]) == 3
+    assert sample["transcript_chunk_mask"].shape == (3,)
 
 
 def test_default_collate_accepts_variable_transcript_lengths(
@@ -346,8 +413,8 @@ def test_default_collate_accepts_variable_transcript_lengths(
         video_filename="68-2.mp4",
         segment_name="gest_0",
         label=POSITIVE_SEGMENT_LABEL,
-        start_ms=10000,
-        end_ms=11000,
+        start_ms=300000,
+        end_ms=301000,
     )
     _write_timed_cha(fixture["transcript_root"] / "68-2.cha", media_ref="68-2")
 
@@ -356,12 +423,6 @@ def test_default_collate_accepts_variable_transcript_lengths(
         negative_landmarks_dir=fixture["negative_root"],
         transcript_dir=fixture["transcript_root"],
         strict_transcripts=False,
-        transcript_kwargs={
-            "context_before_ms": 0,
-            "context_after_ms": 0,
-            "min_utterances_before": 0,
-            "min_utterances_after": 0,
-        },
         return_tensor=True,
     )
 
@@ -378,11 +439,22 @@ def test_default_collate_accepts_variable_transcript_lengths(
     dataset.sample_indices = [pos_index, gap_index]
     dataset.active_indices = [pos_index, gap_index]
 
-    batch = next(iter(DataLoader(dataset, batch_size=2, shuffle=False)))
-    assert isinstance(batch["transcript"], list)
-    assert len(batch["transcript"]) == 2
-    assert batch["transcript"][0]
-    assert batch["transcript"][1] == ""
+    batch = next(
+        iter(
+            DataLoader(
+                dataset,
+                batch_size=2,
+                shuffle=False,
+                collate_fn=gesture_segment_collate_fn,
+            )
+        )
+    )
+    assert isinstance(batch["transcripts"], list)
+    assert len(batch["transcripts"]) == 2
+    assert batch["transcripts"][0]
+    assert batch["transcripts"][1] == ""
+    assert len(batch["transcript_chunks"]) == 2
+    assert batch["transcript_chunk_mask"].shape[0] == 2
     assert batch["landmarks"].shape[0] == 2
 
 
@@ -396,9 +468,12 @@ def main() -> None:
         test_fallback_filename_matching(fixture)
         test_transcript_extraction_and_shapes(fixture)
         test_no_overlap_returns_empty_transcript(fixture)
+        test_expanded_window_includes_nearby_transcript(fixture)
         test_non_strict_missing_transcript(fixture)
         test_strict_missing_transcript(root)
         test_from_existing_preserves_transcript_state(fixture)
+        test_transcript_chunk_partitioning()
+        test_variable_num_transcript_chunks(fixture)
         test_default_collate_accepts_variable_transcript_lengths(fixture)
 
     print("gesture segment transcript tests: OK")

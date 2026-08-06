@@ -449,10 +449,20 @@ def _transcript_cache_key(
     start_ms: int,
     end_ms: int,
     transcript_kwargs: dict[str, Any] | None,
-) -> tuple[str, int, int, tuple[tuple[str, Any], ...]]:
+    *,
+    transcript_offset_seconds: float,
+    num_transcript_chunks: int,
+) -> tuple[str, int, int, tuple[tuple[str, Any], ...], float, int]:
     normalized_kwargs = _normalize_transcript_kwargs(transcript_kwargs)
     frozen_kwargs = tuple(sorted(normalized_kwargs.items()))
-    return (str(transcript_path), start_ms, end_ms, frozen_kwargs)
+    return (
+        str(transcript_path),
+        start_ms,
+        end_ms,
+        frozen_kwargs,
+        float(transcript_offset_seconds),
+        int(num_transcript_chunks),
+    )
 
 
 def _format_transcript_lines(transcript_lines: Sequence[dict[str, Any]]) -> str:
@@ -462,6 +472,53 @@ def _format_transcript_lines(transcript_lines: Sequence[dict[str, Any]]) -> str:
         if str(line.get("text", "")).strip()
     ]
     return "\n".join(formatted_lines)
+
+
+def _utterance_overlaps_interval(
+    utterance: dict[str, Any],
+    interval_start_ms: float,
+    interval_end_ms: float,
+) -> bool:
+    start_ts = int(utterance["start_ts"])
+    end_ts = int(utterance["end_ts"])
+    return start_ts < interval_end_ms and end_ts > interval_start_ms
+
+
+def _build_transcript_chunks(
+    transcript_lines: Sequence[dict[str, Any]],
+    *,
+    window_start_ms: int,
+    window_end_ms: int,
+    num_chunks: int,
+) -> tuple[list[str], torch.Tensor]:
+    """Split ``[window_start_ms, window_end_ms]`` into ``num_chunks`` equal intervals."""
+    if num_chunks <= 0:
+        raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+
+    window_start_ms = max(0, int(window_start_ms))
+    window_end_ms = int(window_end_ms)
+    window_duration_ms = window_end_ms - window_start_ms
+    if window_duration_ms <= 0:
+        empty_chunks = [""] * num_chunks
+        return empty_chunks, torch.zeros(num_chunks, dtype=torch.bool)
+
+    chunk_duration_ms = window_duration_ms / num_chunks
+    chunks: list[str] = []
+    mask_values: list[bool] = []
+
+    for chunk_index in range(num_chunks):
+        chunk_start_ms = window_start_ms + chunk_index * chunk_duration_ms
+        chunk_end_ms = window_start_ms + (chunk_index + 1) * chunk_duration_ms
+        overlapping_lines = [
+            line
+            for line in transcript_lines
+            if _utterance_overlaps_interval(line, chunk_start_ms, chunk_end_ms)
+        ]
+        chunk_text = _format_transcript_lines(overlapping_lines)
+        chunks.append(chunk_text)
+        mask_values.append(bool(chunk_text.strip()))
+
+    return chunks, torch.tensor(mask_values, dtype=torch.bool)
 
 
 def parse_segment_annotation_file(annotation_path: Path) -> dict:
@@ -1577,7 +1634,9 @@ class AphasiaGestureSegmentDataset(Dataset):
     ``__getitem__`` returns:
 
     - ``landmarks``: Tensor or NumPy array
-    - ``transcript``: timestamp-matched CHAT transcript string
+    - ``transcript_chunks``: list of ``num_transcript_chunks`` transcript strings
+    - ``transcript_chunk_mask``: bool tensor ``[num_transcript_chunks]``
+    - ``transcript``: joined non-empty chunk text (legacy/debug convenience)
     - ``label``: ``0`` or ``1``
     - ``gesture_type``: ``NEG`` or ``POS``
     - ``annotation``: segment metadata
@@ -1605,6 +1664,8 @@ class AphasiaGestureSegmentDataset(Dataset):
         strict: bool = False,
         strict_transcripts: bool | None = None,
         transcript_kwargs: dict | None = None,
+        transcript_offset_seconds: float = 3.0,
+        num_transcript_chunks: int = 5,
         num_frames: int | None = None,
         frame_size: tuple[int, int] | None = None,
         rgb: bool = True,
@@ -1623,6 +1684,17 @@ class AphasiaGestureSegmentDataset(Dataset):
         self.transcript_kwargs = (
             dict(transcript_kwargs) if transcript_kwargs is not None else None
         )
+        if num_transcript_chunks <= 0:
+            raise ValueError(
+                f"num_transcript_chunks must be positive, got {num_transcript_chunks}"
+            )
+        if transcript_offset_seconds < 0:
+            raise ValueError(
+                "transcript_offset_seconds must be non-negative, got "
+                f"{transcript_offset_seconds}"
+            )
+        self.transcript_offset_seconds = float(transcript_offset_seconds)
+        self.num_transcript_chunks = int(num_transcript_chunks)
         self.num_frames = num_frames
         self.frame_size = frame_size
         self.rgb = rgb
@@ -1658,8 +1730,8 @@ class AphasiaGestureSegmentDataset(Dataset):
         self._transcript_lookup_warned: set[str] = set()
         self._missing_transcript_warned: set[str] = set()
         self._transcript_cache: dict[
-            tuple[str, int, int, tuple[tuple[str, Any], ...]],
-            str,
+            tuple[str, int, int, tuple[tuple[str, Any], ...], float, int],
+            tuple[list[str], torch.Tensor],
         ] = {}
 
         if self.transcript_dir is not None:
@@ -1710,6 +1782,8 @@ class AphasiaGestureSegmentDataset(Dataset):
         view.strict = dataset.strict
         view.strict_transcripts = dataset.strict_transcripts
         view.transcript_kwargs = dataset.transcript_kwargs
+        view.transcript_offset_seconds = dataset.transcript_offset_seconds
+        view.num_transcript_chunks = dataset.num_transcript_chunks
         view.transcript_dir = dataset.transcript_dir
         view._transcript_by_media_ref = dataset._transcript_by_media_ref
         view._transcript_by_pair_key = dataset._transcript_by_pair_key
@@ -1775,10 +1849,17 @@ class AphasiaGestureSegmentDataset(Dataset):
         real_index = self.active_indices[index]
         sample = self.samples[real_index]
         landmarks = self._read_segment_landmarks(sample.landmarks_path)
-        transcript = self._extract_segment_transcript(sample)
+        transcript_chunks, transcript_chunk_mask = self._extract_segment_transcript_chunks(
+            sample
+        )
+        transcript = "\n".join(
+            chunk for chunk in transcript_chunks if str(chunk).strip()
+        )
 
         return {
             "landmarks": landmarks,
+            "transcript_chunks": transcript_chunks,
+            "transcript_chunk_mask": transcript_chunk_mask,
             "transcript": transcript,
             "label": sample.label,
             "gesture_type": sample.label_name,
@@ -1848,10 +1929,16 @@ class AphasiaGestureSegmentDataset(Dataset):
 
         return start_ms, end_ms
 
-    def _extract_segment_transcript(self, sample: GestureSegmentSample) -> str:
+    def _extract_segment_transcript_chunks(
+        self,
+        sample: GestureSegmentSample,
+    ) -> tuple[list[str], torch.Tensor]:
+        empty_chunks = [""] * self.num_transcript_chunks
+        empty_mask = torch.zeros(self.num_transcript_chunks, dtype=torch.bool)
+
         if sample.transcript_path is None:
             if self.transcript_dir is None:
-                return ""
+                return empty_chunks, empty_mask
 
             warning_key = sample.video_filename.lower()
             message = (
@@ -1864,7 +1951,7 @@ class AphasiaGestureSegmentDataset(Dataset):
             if warning_key not in self._missing_transcript_warned:
                 warnings.warn(message, stacklevel=2)
                 self._missing_transcript_warned.add(warning_key)
-            return ""
+            return empty_chunks, empty_mask
 
         try:
             start_ms, end_ms = self._validate_segment_timestamps(sample)
@@ -1880,35 +1967,48 @@ class AphasiaGestureSegmentDataset(Dataset):
             if warning_key not in self._missing_transcript_warned:
                 warnings.warn(message, stacklevel=2)
                 self._missing_transcript_warned.add(warning_key)
-            return ""
+            return empty_chunks, empty_mask
 
         cache_key = _transcript_cache_key(
             sample.transcript_path,
             start_ms,
             end_ms,
             self.transcript_kwargs,
+            transcript_offset_seconds=self.transcript_offset_seconds,
+            num_transcript_chunks=self.num_transcript_chunks,
         )
         cached = self._transcript_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        if self.transcript_kwargs is None:
-            transcript_lines = get_transcript_lines(
-                sample.transcript_path,
-                start_ms,
-                end_ms,
-            )
-        else:
-            transcript_lines = get_transcript_lines(
-                sample.transcript_path,
-                start_ms,
-                end_ms,
-                **self.transcript_kwargs,
-            )
+        offset_ms = int(round(self.transcript_offset_seconds * 1000.0))
+        window_start_ms = max(0, start_ms - offset_ms)
+        window_end_ms = end_ms + offset_ms
 
-        transcript = _format_transcript_lines(transcript_lines)
-        self._transcript_cache[cache_key] = transcript
-        return transcript
+        transcript_lines = get_transcript_lines(
+            sample.transcript_path,
+            window_start_ms,
+            window_end_ms,
+            context_before_ms=0,
+            context_after_ms=0,
+            min_utterances_before=0,
+            min_utterances_after=0,
+        )
+        transcript_chunks, transcript_chunk_mask = _build_transcript_chunks(
+            transcript_lines,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+            num_chunks=self.num_transcript_chunks,
+        )
+        assert len(transcript_chunks) == self.num_transcript_chunks
+        assert transcript_chunk_mask.shape == (self.num_transcript_chunks,)
+
+        self._transcript_cache[cache_key] = (transcript_chunks, transcript_chunk_mask)
+        return transcript_chunks, transcript_chunk_mask
+
+    def _extract_segment_transcript(self, sample: GestureSegmentSample) -> str:
+        transcript_chunks, _ = self._extract_segment_transcript_chunks(sample)
+        return "\n".join(chunk for chunk in transcript_chunks if str(chunk).strip())
 
     def get_annotation(self, index: int) -> GestureSegmentSample:
         """Return segment metadata for ``index`` without loading frames."""

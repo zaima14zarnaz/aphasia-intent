@@ -569,6 +569,24 @@ def get_batch_transcripts(batch: dict[str, Any]) -> list[str]:
     raise KeyError("Batch is missing 'transcripts'.")
 
 
+def get_batch_transcript_chunks(
+    batch: dict[str, Any],
+    device: torch.device,
+) -> tuple[list[list[str]], torch.Tensor | None]:
+    """Extract chunked transcripts and their validity mask from a collated batch."""
+    if "transcript_chunks" not in batch:
+        raise KeyError("Batch is missing 'transcript_chunks'.")
+
+    transcript_chunks = [
+        [str(chunk) for chunk in sample_chunks]
+        for sample_chunks in batch["transcript_chunks"]
+    ]
+    chunk_mask = batch.get("transcript_chunk_mask")
+    if chunk_mask is None:
+        return transcript_chunks, None
+    return transcript_chunks, chunk_mask.to(device=device, dtype=torch.bool)
+
+
 def _iter_with_progress(
     loader: DataLoader,
     desc: str,
@@ -631,8 +649,17 @@ def train_one_epoch(
         landmarks = landmarks_to_tensor(batch["landmarks"], device)
         labels = get_batch_labels(batch, label_to_idx, device)
         transcripts = get_batch_transcripts(batch)
+        transcript_chunks, transcript_chunk_mask = get_batch_transcript_chunks(
+            batch,
+            device,
+        )
 
-        logits = model(landmarks, transcripts=transcripts)
+        logits = model(
+            landmarks,
+            transcript_chunks=transcript_chunks,
+            transcript_chunk_mask=transcript_chunk_mask,
+            transcripts=transcripts,
+        )
         if not torch.isfinite(logits).all():
             print("logits:", logits)
             print("logits min/max:", logits.nan_to_num().min(), logits.nan_to_num().max())
@@ -680,8 +707,17 @@ def validate_one_epoch(
             landmarks = landmarks_to_tensor(batch["landmarks"], device)
             labels = get_batch_labels(batch, label_to_idx, device)
             transcripts = get_batch_transcripts(batch)
+            transcript_chunks, transcript_chunk_mask = get_batch_transcript_chunks(
+                batch,
+                device,
+            )
 
-            logits = model(landmarks, transcripts=transcripts)
+            logits = model(
+                landmarks,
+                transcript_chunks=transcript_chunks,
+                transcript_chunk_mask=transcript_chunk_mask,
+                transcripts=transcripts,
+            )
             loss = compute_classification_loss(logits, labels)
 
             # print("logits:", sanity_logits[:8])
@@ -769,6 +805,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable transcript encoding and fusion in the model.",
     )
+    parser.add_argument(
+        "--transcript_offset_seconds",
+        type=float,
+        default=3.0,
+        help=(
+            "Seconds of transcript context to include before/after each gesture "
+            "when building temporal transcript chunks."
+        ),
+    )
+    parser.add_argument(
+        "--num_transcript_chunks",
+        type=int,
+        default=5,
+        help="Number of equal-duration transcript chunks in the expanded window.",
+    )
+    parser.add_argument(
+        "--max_transcript_chunks",
+        type=int,
+        default=16,
+        help="Maximum supported transcript chunks for position embeddings.",
+    )
+    parser.add_argument(
+        "--transcript_dropout_probability",
+        type=float,
+        default=0.2,
+        help=(
+            "Training-only probability of dropping all transcript context for a "
+            "sample during modality dropout."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -792,6 +858,10 @@ def print_model_config(args: argparse.Namespace, *, num_classes: int) -> None:
     print(f"  bert_model_name: {args.bert_model_name}")
     print(f"  transcript_embed_dim: {args.transcript_embed_dim}")
     print(f"  freeze_bert: {args.freeze_bert}")
+    print(f"  transcript_offset_seconds: {args.transcript_offset_seconds}")
+    print(f"  num_transcript_chunks: {args.num_transcript_chunks}")
+    print(f"  max_transcript_chunks: {args.max_transcript_chunks}")
+    print(f"  transcript_dropout_probability: {args.transcript_dropout_probability}")
     print()
 
 
@@ -890,6 +960,8 @@ def main() -> None:
         return_tensor=True,
         transcript_dir=args.transcript_dir,
         strict_transcripts=False,
+        transcript_offset_seconds=args.transcript_offset_seconds,
+        num_transcript_chunks=args.num_transcript_chunks,
     )
 
     if len(dataset) == 0:
@@ -1008,6 +1080,9 @@ def main() -> None:
         bert_model_name=args.bert_model_name,
         transcript_embed_dim=args.transcript_embed_dim,
         freeze_bert=args.freeze_bert,
+        num_transcript_chunks=args.num_transcript_chunks,
+        max_transcript_chunks=args.max_transcript_chunks,
+        transcript_dropout_probability=args.transcript_dropout_probability,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -1020,7 +1095,15 @@ def main() -> None:
     sanity_landmarks = landmarks_to_tensor(sanity_batch["landmarks"], device)
     sanity_labels = get_batch_labels(sanity_batch, label_to_idx, device)
     sanity_transcripts = get_batch_transcripts(sanity_batch)
-    sanity_logits = model(sanity_landmarks, transcripts=sanity_transcripts)
+    sanity_transcript_chunks, sanity_transcript_chunk_mask = (
+        get_batch_transcript_chunks(sanity_batch, device)
+    )
+    sanity_logits = model(
+        sanity_landmarks,
+        transcript_chunks=sanity_transcript_chunks,
+        transcript_chunk_mask=sanity_transcript_chunk_mask,
+        transcripts=sanity_transcripts,
+    )
     sanity_loss = compute_classification_loss(sanity_logits, sanity_labels)
 
     print("One-batch sanity check:")
