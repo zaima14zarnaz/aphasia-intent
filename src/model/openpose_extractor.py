@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     import torch
 
 DEFAULT_OPENPOSE_ROOT = Path(
-    "/home/z/zaimazarnaz/research1/Aphasia/src/external/openpose"
+    "/home/z/zaimazarnaz/research1/Aphasia/src/external/mediapipe"
 )
 DEFAULT_IMAGE_PATH = Path(
     "/home/z/zaimazarnaz/research1/Aphasia/src/model/single_frame_2.png"

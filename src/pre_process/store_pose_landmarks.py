@@ -1,5 +1,8 @@
 """
-Extract and store OpenPose BODY_25 pose landmarks for pre-extracted gesture segments.
+Extract and store MediaPipe pose landmarks for pre-extracted gesture segments.
+
+Temporarily supports annotation-only mode: skip landmark extraction and refresh
+``annotation.txt`` files with EAF ``ANNOTATION_ID`` values.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ import math
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -22,15 +26,14 @@ except ImportError:
 
 _PREPROCESS_DIR = Path(__file__).resolve().parent
 _MODEL_DIR = _PREPROCESS_DIR.parent / "model"
+if str(_PREPROCESS_DIR) not in sys.path:
+    sys.path.insert(0, str(_PREPROCESS_DIR))
 if str(_MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(_MODEL_DIR))
 
-from openpose_extractor import (
-    DEFAULT_OPENPOSE_ROOT,
-    NUM_HAND_LANDMARKS,
-    NUM_POSE_LANDMARKS,
-    extract_openpose_landmarks,
-)
+from dataloder import parse_segment_annotation_file  # noqa: E402
+
+from mediapipe_extractor import NUM_POSE_LANDMARKS, extract_pose_landmarks  # noqa: E402
 
 GESTURE_SEGMENT_DIR_RE = re.compile(r"^(gest|neg)_\d+$")
 DEFAULT_SOURCE_ROOT = (
@@ -38,22 +41,72 @@ DEFAULT_SOURCE_ROOT = (
 )
 DEFAULT_DEST_ROOT = (
     "/data/quantization/zaima/aphasiabank/neural2/control/"
-    "gest_segments_landmarks/openpose"
+    "gest_segments_landmarks/mediapipe"
 )
 DEFAULT_NEG_SOURCE_ROOT = (
     "/data/quantization/zaima/aphasiabank/neural2/control/neg_gest_segments"
 )
 DEFAULT_NEG_DEST_ROOT = (
     "/data/quantization/zaima/aphasiabank/neural2/control/"
-    "neg_gest_segments_landmarks/openpose"
+    "neg_gest_segments_landmarks/mediapipe"
 )
-LANDMARK_NAMES = ["x", "y", "z", "confidence"]
+LANDMARK_NAMES = ["x", "y", "z", "visibility"]
+
+# Temporary: skip MediaPipe landmark extraction and only refresh annotation.txt.
+ANNOTATION_ONLY_MODE = True
+
+POSITIVE_ANNOTATION_FIELD_ORDER = (
+    "video_path",
+    "annotation_path",
+    "video_filename",
+    "annotation_filename",
+    "annotation_id",
+    "start_ms",
+    "end_ms",
+    "duration_ms",
+    "gesture_video_index",
+    "marker",
+    "task",
+    "gesture_type",
+    "function",
+    "left_hand_label",
+    "left_hand_shape",
+    "right_hand_label",
+    "right_hand_shape",
+    "raw_tier_values",
+)
+
+NEGATIVE_ANNOTATION_FIELD_ORDER = (
+    "video_path",
+    "annotation_path",
+    "video_filename",
+    "annotation_filename",
+    "annotation_id",
+    "start_ms",
+    "end_ms",
+    "duration_ms",
+    "negative_video_index",
+    "marker",
+    "task",
+    "gesture_type",
+    "function",
+    "left_hand_label",
+    "left_hand_shape",
+    "right_hand_label",
+    "right_hand_shape",
+    "source",
+    "positive_overlap",
+    "length_frames",
+    "fps",
+    "gap_start_ms",
+    "gap_end_ms",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract and store OpenPose BODY_25 landmarks for pre-extracted "
+            "Extract and store MediaPipe pose landmarks for pre-extracted "
             "gesture segment PNG directories."
         )
     )
@@ -70,32 +123,29 @@ def parse_args() -> argparse.Namespace:
         help="Root directory where landmarks.json files will be written.",
     )
     parser.add_argument(
-        "--openpose-root",
-        type=Path,
-        default=DEFAULT_OPENPOSE_ROOT,
-        help="Path to the compiled OpenPose repository.",
-    )
-    parser.add_argument(
-        "--num-gpu-start",
+        "--model-complexity",
         type=int,
         default=1,
-        help="GPU index for OpenPose (default: 1; use 0 if GPU 0 is free).",
+        choices=(0, 1, 2),
+        help="MediaPipe pose model complexity: 0=lite, 1=full, 2=heavy.",
     )
     parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Run OpenPose on CPU instead of GPU.",
+        "--smooth-landmarks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Smooth landmarks across frames (legacy MediaPipe solutions API).",
     )
     parser.add_argument(
-        "--net-resolution",
-        default="-1x368",
-        help="OpenPose net resolution (lower uses less VRAM).",
+        "--min-detection-confidence",
+        type=float,
+        default=0.5,
+        help="Minimum MediaPipe pose detection confidence.",
     )
     parser.add_argument(
-        "--scale-number",
-        type=int,
-        default=1,
-        help="OpenPose scale_number (1 uses least GPU memory).",
+        "--min-tracking-confidence",
+        type=float,
+        default=0.5,
+        help="Minimum MediaPipe pose tracking confidence.",
     )
     parser.add_argument(
         "--overwrite",
@@ -107,11 +157,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional limit on number of segments to process (for debugging).",
-    )
-    parser.add_argument(
-        "--hand",
-        action="store_true",
-        help="Also extract OpenPose hand/finger landmarks (21 keypoints per hand).",
     )
     parser.add_argument(
         "--verbose",
@@ -219,8 +264,6 @@ def build_landmarks_payload(
     frame_paths: list[Path],
     landmarks: np.ndarray,
     num_joints: int,
-    hand_left: np.ndarray | None = None,
-    hand_right: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if landmarks.ndim != 3 or landmarks.shape[1:] != (num_joints, 4):
         raise ValueError(
@@ -234,47 +277,26 @@ def build_landmarks_payload(
             f"frames={len(frame_paths)}, landmarks={landmarks.shape[0]}"
         )
 
-    if hand_left is not None:
-        if hand_left.shape != (len(frame_paths), NUM_HAND_LANDMARKS, 4):
-            raise ValueError(
-                "Expected hand_left with shape "
-                f"[T, {NUM_HAND_LANDMARKS}, 4], got {tuple(hand_left.shape)}"
-            )
-    if hand_right is not None:
-        if hand_right.shape != (len(frame_paths), NUM_HAND_LANDMARKS, 4):
-            raise ValueError(
-                "Expected hand_right with shape "
-                f"[T, {NUM_HAND_LANDMARKS}, 4], got {tuple(hand_right.shape)}"
-            )
-
     frames_payload = []
     for frame_index, frame_path in enumerate(frame_paths):
-        frame_entry = {
-            "frame_index": frame_index,
-            "frame_file": frame_path.name,
-            "landmarks": json_safe(landmarks[frame_index].tolist()),
-        }
-        if hand_left is not None:
-            frame_entry["hand_left"] = json_safe(hand_left[frame_index].tolist())
-        if hand_right is not None:
-            frame_entry["hand_right"] = json_safe(hand_right[frame_index].tolist())
-        frames_payload.append(frame_entry)
+        frames_payload.append(
+            {
+                "frame_index": frame_index,
+                "frame_file": frame_path.name,
+                "landmarks": json_safe(landmarks[frame_index].tolist()),
+            }
+        )
 
-    payload = {
+    return {
         "video_filename": video_filename,
         "segment_name": segment_name,
         "source_segment_dir": str(source_segment_dir),
         "num_frames": len(frame_paths),
         "landmark_shape": [len(frame_paths), num_joints, 4],
         "landmark_format": LANDMARK_NAMES,
-        "extractor": (
-            "openpose_body25_hand21" if hand_left is not None else "openpose_body25"
-        ),
+        "extractor": "mediapipe",
         "frames": frames_payload,
     }
-    if hand_left is not None:
-        payload["hand_landmark_shape"] = [len(frame_paths), NUM_HAND_LANDMARKS, 4]
-    return payload
 
 
 def discover_segment_dirs(source_root: Path) -> list[tuple[Path, str, str]]:
@@ -299,6 +321,177 @@ def discover_segment_dirs(source_root: Path) -> list[tuple[Path, str, str]]:
             )
 
     return segment_entries
+
+
+def _read_text_with_fallback(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="latin-1")
+
+
+def _annotation_line_value(value: Any) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
+
+
+def _parse_marker_gesture_annotation_ids(
+    eaf_path: Path,
+) -> dict[tuple[int, int], str]:
+    """Map ``(start_ms, end_ms)`` to EAF ``ANNOTATION_ID`` for marker GESTURE tiers."""
+    text = _read_text_with_fallback(eaf_path)
+    root = ET.fromstring(text)
+
+    time_slots: dict[str, int] = {}
+    for time_slot in root.findall(".//TIME_SLOT"):
+        slot_id = time_slot.attrib.get("TIME_SLOT_ID")
+        time_value = time_slot.attrib.get("TIME_VALUE")
+        if slot_id is None or time_value is None:
+            continue
+        time_slots[slot_id] = int(time_value)
+
+    annotation_ids: dict[tuple[int, int], str] = {}
+    for tier in root.findall(".//TIER"):
+        if tier.attrib.get("TIER_ID") != "marker":
+            continue
+
+        for alignable in tier.findall(".//ALIGNABLE_ANNOTATION"):
+            annotation_id = alignable.attrib.get("ANNOTATION_ID")
+            ref1 = alignable.attrib.get("TIME_SLOT_REF1")
+            ref2 = alignable.attrib.get("TIME_SLOT_REF2")
+            if ref1 is None or ref2 is None:
+                continue
+            if ref1 not in time_slots or ref2 not in time_slots:
+                continue
+
+            value_elem = alignable.find("ANNOTATION_VALUE")
+            if value_elem is None or value_elem.text is None:
+                continue
+            if value_elem.text.strip() != "GESTURE":
+                continue
+
+            start_ms = time_slots[ref1]
+            end_ms = time_slots[ref2]
+            if annotation_id is not None:
+                annotation_ids[(start_ms, end_ms)] = annotation_id
+
+    return annotation_ids
+
+
+def _lookup_gesture_annotation_id(
+    annotation: dict[str, Any],
+    *,
+    eaf_cache: dict[str, dict[tuple[int, int], str]],
+) -> str | None:
+    """Resolve the EAF ``ANNOTATION_ID`` for one gesture segment."""
+    annotation_path = annotation.get("annotation_path")
+    start_ms = annotation.get("start_ms")
+    end_ms = annotation.get("end_ms")
+    if not annotation_path or start_ms is None or end_ms is None:
+        return None
+
+    eaf_path = Path(str(annotation_path))
+    if not eaf_path.is_file():
+        return None
+
+    cache_key = str(eaf_path.resolve())
+    if cache_key not in eaf_cache:
+        try:
+            eaf_cache[cache_key] = _parse_marker_gesture_annotation_ids(eaf_path)
+        except ET.ParseError:
+            eaf_cache[cache_key] = {}
+
+    return eaf_cache[cache_key].get((int(start_ms), int(end_ms)))
+
+
+def _annotation_field_order(annotation: dict[str, Any]) -> tuple[str, ...]:
+    if annotation.get("marker") == "negative" or "negative_video_index" in annotation:
+        return NEGATIVE_ANNOTATION_FIELD_ORDER
+    return POSITIVE_ANNOTATION_FIELD_ORDER
+
+
+def write_annotation_metadata(annotation: dict[str, Any], output_dir: Path) -> None:
+    """Write gesture or negative segment metadata to ``annotation.txt``."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_tier_values = annotation.get("raw_tier_values", {})
+    if not isinstance(raw_tier_values, dict):
+        raw_tier_values = {}
+
+    ordered_fields = _annotation_field_order(annotation)
+    lines: list[str] = []
+    for field in ordered_fields:
+        if field == "raw_tier_values":
+            if "raw_tier_values" not in annotation:
+                continue
+            lines.append(
+                f"raw_tier_values: {json.dumps(raw_tier_values, ensure_ascii=True)}"
+            )
+            continue
+        if field not in annotation:
+            continue
+        lines.append(f"{field}: {_annotation_line_value(annotation[field])}")
+
+    written_fields = set(ordered_fields)
+    for field in sorted(annotation):
+        if field in written_fields:
+            continue
+        lines.append(f"{field}: {_annotation_line_value(annotation[field])}")
+
+    (output_dir / "annotation.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def process_segment_annotation(
+    *,
+    source_segment_dir: Path,
+    dest_segment_dir: Path,
+    overwrite: bool,
+    verbose: bool,
+    eaf_cache: dict[str, dict[tuple[int, int], str]],
+) -> str:
+    """
+    Copy and enrich one segment's ``annotation.txt`` with EAF ``annotation_id``.
+
+    Returns:
+        One of: "processed", "skipped", "failed_no_annotation"
+    """
+    source_annotation_path = source_segment_dir / "annotation.txt"
+    dest_annotation_path = dest_segment_dir / "annotation.txt"
+
+    if not source_annotation_path.is_file():
+        print(
+            f"Warning: missing annotation.txt in source segment: {source_segment_dir}"
+        )
+        return "failed_no_annotation"
+
+    if dest_annotation_path.is_file() and not overwrite:
+        existing = parse_segment_annotation_file(dest_annotation_path)
+        if existing.get("annotation_id"):
+            if verbose:
+                print(f"Skipping existing annotation: {dest_annotation_path}")
+            return "skipped"
+
+    annotation = parse_segment_annotation_file(source_annotation_path)
+    annotation["annotation_id"] = _lookup_gesture_annotation_id(
+        annotation,
+        eaf_cache=eaf_cache,
+    )
+
+    dest_segment_dir.mkdir(parents=True, exist_ok=True)
+    write_annotation_metadata(annotation, dest_segment_dir)
+
+    if verbose:
+        print(
+            f"Saved annotation: {dest_annotation_path} "
+            f"(annotation_id={annotation.get('annotation_id')!r})"
+        )
+
+    return "processed"
 
 
 def copy_annotation_file(
@@ -326,21 +519,29 @@ def process_segment(
     dest_segment_dir: Path,
     video_filename: str,
     segment_name: str,
-    openpose_root: Path,
-    num_gpu: int,
-    num_gpu_start: int,
-    net_resolution: str,
-    scale_number: int,
-    enable_hand: bool,
+    model_complexity: int,
+    smooth_landmarks: bool,
+    min_detection_confidence: float,
+    min_tracking_confidence: float,
     overwrite: bool,
     verbose: bool,
+    eaf_cache: dict[str, dict[tuple[int, int], str]],
 ) -> str:
     """
     Process one gesture segment.
 
     Returns:
-        One of: "processed", "skipped", "failed_no_frames"
+        One of: "processed", "skipped", "failed_no_frames", "failed_no_annotation"
     """
+    if ANNOTATION_ONLY_MODE:
+        return process_segment_annotation(
+            source_segment_dir=source_segment_dir,
+            dest_segment_dir=dest_segment_dir,
+            overwrite=overwrite,
+            verbose=verbose,
+            eaf_cache=eaf_cache,
+        )
+
     dest_landmarks_path = dest_segment_dir / "landmarks.json"
 
     if dest_landmarks_path.exists() and not overwrite:
@@ -354,17 +555,13 @@ def process_segment(
         return "failed_no_frames"
 
     frames = load_segment_frames(frame_paths)
-    extracted = extract_openpose_landmarks(
+    landmarks = extract_pose_landmarks(
         frames,
-        openpose_root=openpose_root,
-        enable_hand=enable_hand,
-        num_gpu=num_gpu,
-        num_gpu_start=num_gpu_start,
-        net_resolution=net_resolution,
-        scale_number=scale_number,
-        verbose=verbose,
+        model_complexity=model_complexity,
+        smooth_landmarks=smooth_landmarks,
+        min_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=min_tracking_confidence,
     )
-    landmarks = extracted["pose_body25"]
     assert isinstance(landmarks, np.ndarray)
 
     payload = build_landmarks_payload(
@@ -374,8 +571,6 @@ def process_segment(
         frame_paths=frame_paths,
         landmarks=landmarks,
         num_joints=NUM_POSE_LANDMARKS,
-        hand_left=extracted.get("hand_left"),
-        hand_right=extracted.get("hand_right"),
     )
 
     dest_segment_dir.mkdir(parents=True, exist_ok=True)
@@ -383,7 +578,13 @@ def process_segment(
         json.dump(json_safe(payload), output_file, indent=2)
         output_file.write("\n")
 
-    copy_annotation_file(source_segment_dir, dest_segment_dir, verbose=verbose)
+    process_segment_annotation(
+        source_segment_dir=source_segment_dir,
+        dest_segment_dir=dest_segment_dir,
+        overwrite=True,
+        verbose=verbose,
+        eaf_cache=eaf_cache,
+    )
 
     if verbose:
         print(f"Saved landmarks: {dest_landmarks_path}")
@@ -395,12 +596,10 @@ def run_batch(
     *,
     source_root: Path,
     dest_root: Path,
-    openpose_root: Path,
-    num_gpu: int,
-    num_gpu_start: int,
-    net_resolution: str,
-    scale_number: int,
-    enable_hand: bool,
+    model_complexity: int,
+    smooth_landmarks: bool,
+    min_detection_confidence: float,
+    min_tracking_confidence: float,
     overwrite: bool,
     max_segments: int | None,
     verbose: bool,
@@ -424,11 +623,11 @@ def run_batch(
 
     print(f"Source root: {source_root}")
     print(f"Destination root: {dest_root}")
-    print(f"OpenPose root: {openpose_root}")
-    print(f"GPU mode: {'CPU' if num_gpu == 0 else f'CUDA gpu={num_gpu_start}'}")
-    print(f"Landmarks per frame: {NUM_POSE_LANDMARKS} body (BODY_25)")
-    if enable_hand:
-        print(f"Hand landmarks per frame: {NUM_HAND_LANDMARKS} per hand")
+    if ANNOTATION_ONLY_MODE:
+        print("Mode: annotation-only (landmark extraction temporarily disabled)")
+    else:
+        print(f"MediaPipe model complexity: {model_complexity}")
+        print(f"Landmarks per frame: {NUM_POSE_LANDMARKS} body (MediaPipe Pose)")
     print(f"Video directories found: {len(video_dirs)}")
     print(f"Segment directories found: {len(segment_entries)}")
     print()
@@ -436,10 +635,16 @@ def run_batch(
     processed_count = 0
     skipped_count = 0
     failed_count = 0
+    eaf_cache: dict[str, dict[tuple[int, int], str]] = {}
 
+    progress_desc = (
+        "Writing segment annotations"
+        if ANNOTATION_ONLY_MODE
+        else "Storing MediaPipe landmarks"
+    )
     iterator = segment_entries
     if tqdm is not None:
-        iterator = tqdm(segment_entries, desc="Storing OpenPose landmarks", unit="segment")
+        iterator = tqdm(segment_entries, desc=progress_desc, unit="segment")
 
     for index, (source_segment_dir, video_filename, segment_name) in enumerate(
         iterator, start=1
@@ -457,14 +662,13 @@ def run_batch(
                 dest_segment_dir=dest_segment_dir,
                 video_filename=video_filename,
                 segment_name=segment_name,
-                openpose_root=openpose_root,
-                num_gpu=num_gpu,
-                num_gpu_start=num_gpu_start,
-                net_resolution=net_resolution,
-                scale_number=scale_number,
-                enable_hand=enable_hand,
+                model_complexity=model_complexity,
+                smooth_landmarks=smooth_landmarks,
+                min_detection_confidence=min_detection_confidence,
+                min_tracking_confidence=min_tracking_confidence,
                 overwrite=overwrite,
                 verbose=verbose,
+                eaf_cache=eaf_cache,
             )
         except Exception as exc:
             failed_count += 1
@@ -501,12 +705,10 @@ def main() -> None:
     run_batch(
         source_root=args.source_root,
         dest_root=args.dest_root,
-        openpose_root=args.openpose_root.expanduser().resolve(),
-        num_gpu=0 if args.cpu else 1,
-        num_gpu_start=args.num_gpu_start,
-        net_resolution=args.net_resolution,
-        scale_number=args.scale_number,
-        enable_hand=args.hand,
+        model_complexity=args.model_complexity,
+        smooth_landmarks=args.smooth_landmarks,
+        min_detection_confidence=args.min_detection_confidence,
+        min_tracking_confidence=args.min_tracking_confidence,
         overwrite=args.overwrite,
         max_segments=args.max_segments,
         verbose=args.verbose,

@@ -22,8 +22,15 @@ from dataloder import (  # noqa: E402
     NEGATIVE_SEGMENT_LABEL,
     POSITIVE_SEGMENT_LABEL,
     _build_transcript_chunks,
+    _build_transcript_alignment_mask,
     _build_transcript_lookup,
+    _clean_alignment_transcript_markers,
+    _find_best_aligned_transcript_chunk_index,
+    _find_gesture_text_alignment,
+    _load_alignment_anns_payload,
     _parse_cha_media_reference,
+    _parse_media_timestamp_to_ms,
+    _resolve_alignment_anns_path,
     _scan_cha_transcript_files,
 )
 from collate import gesture_segment_collate_fn  # noqa: E402
@@ -405,6 +412,101 @@ def test_variable_num_transcript_chunks(fixture: dict[str, Path]) -> None:
     assert sample["transcript_chunk_mask"].shape == (3,)
 
 
+def test_clean_alignment_transcript_markers() -> None:
+    raw = (
+        "PAR: and I would <+utt_s>open the lid<+utt_e> of the peanut butter first "
+        "because I don't know why ."
+    )
+    cleaned = _clean_alignment_transcript_markers(raw)
+    assert "<+utt_s>" not in cleaned
+    assert "<+utt_e>" not in cleaned
+    assert "open the lid" in cleaned
+
+
+def test_transcript_alignment_mask_selects_best_chunk() -> None:
+    transcript_chunks = [
+        "INV: can you tell me about your trip ?",
+        "PAR: open the lid of the peanut butter first",
+        "PAR: no overlap here .",
+        "",
+        "",
+    ]
+    full_transcript = (
+        "PAR: and I would open the lid of the peanut butter first because I don't "
+        "know why ."
+    )
+    aligned_utterance = "open the lid"
+
+    match_index = _find_best_aligned_transcript_chunk_index(
+        transcript_chunks,
+        full_transcript=full_transcript,
+        aligned_utterance=aligned_utterance,
+    )
+    assert match_index == 1
+
+    alignment_mask = _build_transcript_alignment_mask(
+        transcript_chunks,
+        full_transcript=full_transcript,
+        aligned_utterance=aligned_utterance,
+    )
+    assert alignment_mask.tolist() == [0.0, 1.0, 0.0, 0.0, 0.0]
+
+
+def test_transcript_alignment_mask_zeros_without_match() -> None:
+    transcript_chunks = ["PAR: unrelated text", "INV: something else"]
+    alignment_mask = _build_transcript_alignment_mask(
+        transcript_chunks,
+        full_transcript="PAR: completely different words",
+        aligned_utterance="missing phrase",
+    )
+    assert alignment_mask.tolist() == [0.0, 0.0]
+
+
+def test_gesture_text_alignment_matching() -> None:
+    alignment_path = Path(
+        "/data/quantization/zaima/aphasiabank/neural2/control/ts_videos/"
+        "alignment_anns/65-1_anns.json"
+    )
+    if not alignment_path.is_file():
+        return
+
+    annotations = _load_alignment_anns_payload(
+        alignment_path,
+        expected_video_filename="65-1.mp4",
+    )
+    matched = _find_gesture_text_alignment(
+        annotations,
+        annotation_id="a1689",
+    )
+    assert matched is not None
+    assert matched["aligned_utterance"] == "open the lid"
+    assert matched["aligned_utt_start_ts"] == "01:47:59.360"
+    assert matched["aligned_utt_end_ts"] == "01:48:00.240"
+    assert "open the lid" in matched["full_transcript"]
+    assert "<+utt_s>" not in matched["full_transcript"]
+    assert "<+utt_e>" not in matched["full_transcript"]
+
+    assert _find_gesture_text_alignment(annotations, annotation_id="missing") is None
+    assert _find_gesture_text_alignment(annotations, annotation_id=None) is None
+
+
+def test_alignment_filename_resolution() -> None:
+    alignment_dir = Path(
+        "/data/quantization/zaima/aphasiabank/neural2/control/ts_videos/alignment_anns"
+    )
+    if not alignment_dir.is_dir():
+        return
+
+    resolved = _resolve_alignment_anns_path(alignment_dir, "65-1.mp4")
+    assert resolved is not None
+    assert resolved.name == "65-1_anns.json"
+    payload = _load_alignment_anns_payload(
+        resolved,
+        expected_video_filename="65-1.mp4",
+    )
+    assert len(payload) >= 1
+
+
 def test_default_collate_accepts_variable_transcript_lengths(
     fixture: dict[str, Path],
 ) -> None:
@@ -474,6 +576,11 @@ def main() -> None:
         test_from_existing_preserves_transcript_state(fixture)
         test_transcript_chunk_partitioning()
         test_variable_num_transcript_chunks(fixture)
+        test_clean_alignment_transcript_markers()
+        test_transcript_alignment_mask_selects_best_chunk()
+        test_transcript_alignment_mask_zeros_without_match()
+        test_gesture_text_alignment_matching()
+        test_alignment_filename_resolution()
         test_default_collate_accepts_variable_transcript_lengths(fixture)
 
     print("gesture segment transcript tests: OK")

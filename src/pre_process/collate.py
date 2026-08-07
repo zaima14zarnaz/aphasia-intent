@@ -217,6 +217,11 @@ def gesture_segment_collate_fn(batch: list[dict]) -> dict:
     transcripts = [str(sample.get("transcript", "")) for sample in batch]
     transcript_chunks = [list(sample.get("transcript_chunks", [])) for sample in batch]
     chunk_masks = [sample.get("transcript_chunk_mask") for sample in batch]
+    aligned_utt_start_ts = [sample.get("aligned_utt_start_ts") for sample in batch]
+    aligned_utt_end_ts = [sample.get("aligned_utt_end_ts") for sample in batch]
+    aligned_utterances = [sample.get("aligned_utterance") for sample in batch]
+    full_transcripts = [sample.get("full_transcript") for sample in batch]
+    alignment_masks = [sample.get("transcript_alignment_mask") for sample in batch]
 
     if any(mask is not None for mask in chunk_masks):
         if not all(mask is not None for mask in chunk_masks):
@@ -242,6 +247,32 @@ def gesture_segment_collate_fn(batch: list[dict]) -> dict:
     else:
         transcript_chunk_mask = None
 
+    if any(mask is not None for mask in alignment_masks):
+        if not all(mask is not None for mask in alignment_masks):
+            raise ValueError(
+                "All samples in a batch must provide transcript_alignment_mask when "
+                "alignment masks are used."
+            )
+        num_alignment_chunks = alignment_masks[0].shape[0]
+        for sample_mask in alignment_masks:
+            if int(sample_mask.shape[0]) != num_alignment_chunks:
+                raise ValueError(
+                    "transcript_alignment_mask length must be consistent within a "
+                    "batch."
+                )
+        transcript_alignment_mask = torch.stack(
+            [
+                torch.as_tensor(
+                    sample_mask,
+                    dtype=torch.float32,
+                )
+                for sample_mask in alignment_masks
+            ],
+            dim=0,
+        )
+    else:
+        transcript_alignment_mask = None
+
     return {
         "landmarks": padded_landmarks,
         "landmark_mask": landmark_mask,
@@ -252,6 +283,11 @@ def gesture_segment_collate_fn(batch: list[dict]) -> dict:
         "transcripts": transcripts,
         "transcript_chunks": transcript_chunks,
         "transcript_chunk_mask": transcript_chunk_mask,
+        "aligned_utt_start_ts": aligned_utt_start_ts,
+        "aligned_utt_end_ts": aligned_utt_end_ts,
+        "aligned_utterance": aligned_utterances,
+        "full_transcript": full_transcripts,
+        "transcript_alignment_mask": transcript_alignment_mask,
         "gesture_types": gesture_types,
         "annotations": annotations,
         "lengths": lengths,

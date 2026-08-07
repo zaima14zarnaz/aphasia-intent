@@ -9,6 +9,7 @@ gesture detection (POS=1, NEG=0).
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib
 import random
 import sys
@@ -21,7 +22,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from losses import compute_classification_loss
+from losses import (
+    alignment_warmup_factor,
+    compute_alignment_target_probability,
+    compute_classification_loss,
+    compute_masked_alignment_loss,
+    get_batch_alignment_targets,
+)
 from metrics import GestureClassificationMetrics, format_metrics, print_per_class_accuracy
 from model.custom_mamba import LandmarkGestureClassifier
 # from model.llm_based import LLMBasedGestureClassifier
@@ -67,9 +74,45 @@ BEST_MODEL_PATH = _SRC_DIR / "best_landmark_gesture_classifier.pt"
 FREQUENT_MISCLASSIFICATION_PATH = (
     _SRC_DIR / "training_outputs" / "frequently_misclassified_val_samples.txt"
 )
+RESULTS_PER_EPOCH_PATH = _SRC_DIR / "training_outputs" / "results_per_epoch.csv"
+RESULTS_PER_EPOCH_FIELDNAMES = (
+    "epoch",
+    "train_acc",
+    "train_precision",
+    "train_recall",
+    "train_f1",
+    "val_acc",
+    "val_precision",
+    "val_recall",
+    "val_f1",
+    "val_pos_acc",
+    "val_neg_acc"
+)
 FREQUENT_MISCLASSIFICATION_THRESHOLD = 0.9
 
-NUM_EPOCHS = 200
+FIXED_TRAIN_VIDEO_KEYS = frozenset(
+    {
+        "65_1",
+        "81_1",
+        "92_1",
+        "101_1",
+        "104_1",
+        "105_1",
+        "121_1",
+        "123_1",
+        "128_1",
+    }
+)
+FIXED_VAL_VIDEO_KEYS = frozenset(
+    {
+        "133_1",
+        "171_1",
+        "202_1",
+        "208_1",
+    }
+)
+
+NUM_EPOCHS = 120
 BATCH_SIZE = 16
 NUM_FRAMES = 128
 NUM_JOINTS = NUM_MEDIAPIPE_FACE_UPPER_BODY_LANDMARKS
@@ -555,6 +598,40 @@ def print_frequently_misclassified_val_samples(
     print(f"Saved sample names to: {output_path}")
 
 
+def init_results_per_epoch_csv(output_path: Path) -> None:
+    """Create or overwrite the per-epoch metrics CSV with a header row."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=RESULTS_PER_EPOCH_FIELDNAMES)
+        writer.writeheader()
+
+
+def append_results_per_epoch_row(
+    output_path: Path,
+    *,
+    epoch: int,
+    train_metrics: dict[str, Any],
+    val_metrics: dict[str, Any],
+) -> None:
+    """Append one epoch of train/val classification metrics to the CSV."""
+    row = {
+        "epoch": epoch,
+        "train_acc": float(train_metrics["accuracy"]),
+        "train_precision": float(train_metrics["precision"]),
+        "train_recall": float(train_metrics["recall"]),
+        "train_f1": float(train_metrics["f1"]),
+        "val_acc": float(val_metrics["accuracy"]),
+        "val_precision": float(val_metrics["precision"]),
+        "val_recall": float(val_metrics["recall"]),
+        "val_f1": float(val_metrics["f1"]),
+        "val_pos_acc": float(val_metrics["per_class_accuracy"].get("POS")),
+        "val_neg_acc": float(val_metrics["per_class_accuracy"].get("NEG")),
+    }
+    with output_path.open("a", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=RESULTS_PER_EPOCH_FIELDNAMES)
+        writer.writerow(row)
+
+
 def landmarks_to_tensor(
     landmarks: np.ndarray | torch.Tensor,
     device: torch.device,
@@ -633,7 +710,14 @@ def train_one_epoch(
     label_to_idx: dict[str, int],
     num_classes: int,
     idx_to_label: dict[int, str],
-) -> tuple[float, dict]:
+    *,
+    epoch: int,
+    expected_num_chunks: int,
+    alignment_loss_weight: float,
+    alignment_label_smoothing: float,
+    alignment_warmup_epochs: int,
+    use_alignment_supervision: bool,
+) -> dict[str, float]:
     model.train()
     metrics_tracker = GestureClassificationMetrics(
         num_classes=num_classes,
@@ -642,7 +726,18 @@ def train_one_epoch(
     metrics_tracker.reset()
 
     total_loss = 0.0
+    total_classification_loss = 0.0
+    total_alignment_loss = 0.0
+    total_alignment_target_probability = 0.0
+    total_annotated_alignment_samples = 0
     total_samples = 0
+
+    warmup_factor = alignment_warmup_factor(epoch, alignment_warmup_epochs)
+    effective_alignment_weight = (
+        alignment_loss_weight * warmup_factor
+        if use_alignment_supervision
+        else 0.0
+    )
 
     progress_bar = _iter_with_progress(loader, desc="train")
     for batch in progress_bar:
@@ -654,18 +749,65 @@ def train_one_epoch(
             device,
         )
 
-        logits = model(
-            landmarks,
-            transcript_chunks=transcript_chunks,
-            transcript_chunk_mask=transcript_chunk_mask,
-            transcripts=transcripts,
-        )
-        if not torch.isfinite(logits).all():
-            print("logits:", logits)
-            print("logits min/max:", logits.nan_to_num().min(), logits.nan_to_num().max())
-            raise RuntimeError("Model produced NaN/Inf logits")
-            
-        loss = compute_classification_loss(logits, labels)
+        if use_alignment_supervision:
+            alignment_targets = get_batch_alignment_targets(
+                batch,
+                device,
+                expected_num_chunks,
+            )
+            (
+                logits,
+                attention_weights,
+                _modality_gate,
+                returned_chunk_mask,
+            ) = model(
+                landmarks,
+                transcript_chunks=transcript_chunks,
+                transcript_chunk_mask=transcript_chunk_mask,
+                transcripts=transcripts,
+                return_attention=True,
+            )
+            if not torch.isfinite(logits).all():
+                print("logits:", logits)
+                print("logits min/max:", logits.nan_to_num().min(), logits.nan_to_num().max())
+                raise RuntimeError("Model produced NaN/Inf logits")
+
+            if returned_chunk_mask is None:
+                if transcript_chunk_mask is None:
+                    raise ValueError(
+                        "Model returned no transcript_chunk_mask and batch did not "
+                        "provide one."
+                    )
+                returned_chunk_mask = transcript_chunk_mask
+
+            classification_loss = compute_classification_loss(logits, labels)
+            alignment_loss, num_annotated, mean_attention = (
+                compute_masked_alignment_loss(
+                    attention_weights,
+                    alignment_targets,
+                    returned_chunk_mask,
+                    label_smoothing=alignment_label_smoothing,
+                )
+            )
+            loss = classification_loss + effective_alignment_weight * alignment_loss
+        else:
+            logits = model(
+                landmarks,
+                transcript_chunks=transcript_chunks,
+                transcript_chunk_mask=transcript_chunk_mask,
+                transcripts=transcripts,
+                return_attention=False,
+            )
+            if not torch.isfinite(logits).all():
+                print("logits:", logits)
+                print("logits min/max:", logits.nan_to_num().min(), logits.nan_to_num().max())
+                raise RuntimeError("Model produced NaN/Inf logits")
+
+            classification_loss = compute_classification_loss(logits, labels)
+            alignment_loss = logits.new_tensor(0.0)
+            num_annotated = 0
+            mean_attention = None
+            loss = classification_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -673,13 +815,46 @@ def train_one_epoch(
 
         batch_size = labels.shape[0]
         total_loss += loss.item() * batch_size
+        total_classification_loss += classification_loss.item() * batch_size
+        total_alignment_loss += alignment_loss.item() * batch_size
         total_samples += batch_size
+        if use_alignment_supervision and num_annotated > 0:
+            batch_target_probability = compute_alignment_target_probability(
+                mean_attention,
+                alignment_targets,
+            )
+            total_alignment_target_probability += (
+                batch_target_probability.item() * num_annotated
+            )
+            total_annotated_alignment_samples += num_annotated
         metrics_tracker.update(logits, labels)
         _update_progress_bar(progress_bar, total_loss, total_samples, metrics_tracker)
-        
 
-    average_loss = 0.0 if total_samples == 0 else total_loss / total_samples
-    return average_loss, metrics_tracker.compute()
+    average_total_loss = 0.0 if total_samples == 0 else total_loss / total_samples
+    average_classification_loss = (
+        0.0 if total_samples == 0 else total_classification_loss / total_samples
+    )
+    average_alignment_loss = (
+        0.0 if total_samples == 0 else total_alignment_loss / total_samples
+    )
+    average_alignment_target_probability = (
+        0.0
+        if total_annotated_alignment_samples == 0
+        else total_alignment_target_probability / total_annotated_alignment_samples
+    )
+
+    metrics = metrics_tracker.compute()
+    metrics.update(
+        {
+            "total_loss": average_total_loss,
+            "classification_loss": average_classification_loss,
+            "alignment_loss": average_alignment_loss,
+            "annotated_alignment_samples": float(total_annotated_alignment_samples),
+            "alignment_target_probability": average_alignment_target_probability,
+            "effective_alignment_weight": effective_alignment_weight,
+        }
+    )
+    return metrics
 
 
 def validate_one_epoch(
@@ -689,8 +864,15 @@ def validate_one_epoch(
     label_to_idx: dict[str, int],
     num_classes: int,
     idx_to_label: dict[int, str],
+    *,
+    expected_num_chunks: int,
+    alignment_loss_weight: float,
+    alignment_label_smoothing: float,
+    alignment_warmup_epochs: int,
+    epoch: int,
+    use_alignment_supervision: bool,
     misclassification_counts: dict[str, int] | None = None,
-) -> tuple[float, dict]:
+) -> dict[str, float]:
     model.eval()
     metrics_tracker = GestureClassificationMetrics(
         num_classes=num_classes,
@@ -699,7 +881,18 @@ def validate_one_epoch(
     metrics_tracker.reset()
 
     total_loss = 0.0
+    total_classification_loss = 0.0
+    total_alignment_loss = 0.0
+    total_alignment_target_probability = 0.0
+    total_annotated_alignment_samples = 0
     total_samples = 0
+
+    warmup_factor = alignment_warmup_factor(epoch, alignment_warmup_epochs)
+    effective_alignment_weight = (
+        alignment_loss_weight * warmup_factor
+        if use_alignment_supervision
+        else 0.0
+    )
 
     progress_bar = _iter_with_progress(loader, desc="val")
     with torch.no_grad():
@@ -712,25 +905,71 @@ def validate_one_epoch(
                 device,
             )
 
-            logits = model(
-                landmarks,
-                transcript_chunks=transcript_chunks,
-                transcript_chunk_mask=transcript_chunk_mask,
-                transcripts=transcripts,
-            )
-            loss = compute_classification_loss(logits, labels)
+            if use_alignment_supervision:
+                alignment_targets = get_batch_alignment_targets(
+                    batch,
+                    device,
+                    expected_num_chunks,
+                )
+                (
+                    logits,
+                    attention_weights,
+                    _modality_gate,
+                    returned_chunk_mask,
+                ) = model(
+                    landmarks,
+                    transcript_chunks=transcript_chunks,
+                    transcript_chunk_mask=transcript_chunk_mask,
+                    transcripts=transcripts,
+                    return_attention=True,
+                )
 
-            # print("logits:", sanity_logits[:8])
-            # print("logits mean:", sanity_logits.mean(dim=0))
-            # print("logits std:", logits.std(dim=0))
-            # print("margin mean:", (logits[:, 1] - logits[:, 0]).mean())
-            # print("margin std:", (logits[:, 1] - logits[:, 0]).std())
-            # print("pred counts:", torch.bincount(logits.argmax(dim=1), minlength=2))
-            # print("label counts:", torch.bincount(labels.long(), minlength=2))
+                if returned_chunk_mask is None:
+                    if transcript_chunk_mask is None:
+                        raise ValueError(
+                            "Model returned no transcript_chunk_mask and batch did not "
+                            "provide one."
+                        )
+                    returned_chunk_mask = transcript_chunk_mask
+
+                classification_loss = compute_classification_loss(logits, labels)
+                alignment_loss, num_annotated, mean_attention = (
+                    compute_masked_alignment_loss(
+                        attention_weights,
+                        alignment_targets,
+                        returned_chunk_mask,
+                        label_smoothing=alignment_label_smoothing,
+                    )
+                )
+                loss = classification_loss + effective_alignment_weight * alignment_loss
+            else:
+                logits = model(
+                    landmarks,
+                    transcript_chunks=transcript_chunks,
+                    transcript_chunk_mask=transcript_chunk_mask,
+                    transcripts=transcripts,
+                    return_attention=False,
+                )
+                classification_loss = compute_classification_loss(logits, labels)
+                alignment_loss = logits.new_tensor(0.0)
+                num_annotated = 0
+                mean_attention = None
+                loss = classification_loss
 
             batch_size = labels.shape[0]
             total_loss += loss.item() * batch_size
+            total_classification_loss += classification_loss.item() * batch_size
+            total_alignment_loss += alignment_loss.item() * batch_size
             total_samples += batch_size
+            if use_alignment_supervision and num_annotated > 0:
+                batch_target_probability = compute_alignment_target_probability(
+                    mean_attention,
+                    alignment_targets,
+                )
+                total_alignment_target_probability += (
+                    batch_target_probability.item() * num_annotated
+                )
+                total_annotated_alignment_samples += num_annotated
             metrics_tracker.update(logits, labels)
             if misclassification_counts is not None:
                 if "annotations" not in batch:
@@ -751,8 +990,31 @@ def validate_one_epoch(
                 metrics_tracker,
             )
 
-    average_loss = 0.0 if total_samples == 0 else total_loss / total_samples
-    return average_loss, metrics_tracker.compute()
+    average_total_loss = 0.0 if total_samples == 0 else total_loss / total_samples
+    average_classification_loss = (
+        0.0 if total_samples == 0 else total_classification_loss / total_samples
+    )
+    average_alignment_loss = (
+        0.0 if total_samples == 0 else total_alignment_loss / total_samples
+    )
+    average_alignment_target_probability = (
+        0.0
+        if total_annotated_alignment_samples == 0
+        else total_alignment_target_probability / total_annotated_alignment_samples
+    )
+
+    metrics = metrics_tracker.compute()
+    metrics.update(
+        {
+            "total_loss": average_total_loss,
+            "classification_loss": average_classification_loss,
+            "alignment_loss": average_alignment_loss,
+            "annotated_alignment_samples": float(total_annotated_alignment_samples),
+            "alignment_target_probability": average_alignment_target_probability,
+            "effective_alignment_weight": effective_alignment_weight,
+        }
+    )
+    return metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -835,7 +1097,42 @@ def parse_args() -> argparse.Namespace:
             "sample during modality dropout."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--alignment_loss_weight",
+        type=float,
+        default=0.01,
+        help="Weight for auxiliary pose-to-chunk alignment loss.",
+    )
+    parser.add_argument(
+        "--alignment_label_smoothing",
+        type=float,
+        default=0.00,
+        help="Label smoothing applied to alignment targets across valid chunks.",
+    )
+    parser.add_argument(
+        "--alignment_warmup_epochs",
+        type=int,
+        default=5,
+        help="Linear warmup epochs for the alignment loss weight.",
+    )
+    parser.add_argument(
+        "--no_alignment_supervision",
+        action="store_true",
+        help=(
+            "Disable alignment annotation targets and auxiliary alignment loss "
+            "during training and validation."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.alignment_loss_weight < 0:
+        parser.error("--alignment_loss_weight must be non-negative.")
+    if not 0.0 <= args.alignment_label_smoothing < 1.0:
+        parser.error("--alignment_label_smoothing must be in [0, 1).")
+    if args.alignment_warmup_epochs < 0:
+        parser.error("--alignment_warmup_epochs must be non-negative.")
+
+    return args
 
 
 def print_model_config(args: argparse.Namespace, *, num_classes: int) -> None:
@@ -862,6 +1159,10 @@ def print_model_config(args: argparse.Namespace, *, num_classes: int) -> None:
     print(f"  num_transcript_chunks: {args.num_transcript_chunks}")
     print(f"  max_transcript_chunks: {args.max_transcript_chunks}")
     print(f"  transcript_dropout_probability: {args.transcript_dropout_probability}")
+    print(f"  alignment_loss_weight: {args.alignment_loss_weight}")
+    print(f"  alignment_label_smoothing: {args.alignment_label_smoothing}")
+    print(f"  alignment_warmup_epochs: {args.alignment_warmup_epochs}")
+    print(f"  alignment_supervision: {not args.no_alignment_supervision}")
     print()
 
 
@@ -902,6 +1203,148 @@ def split_train_val_indices(
     train_indices = all_indices[:train_count]
     val_indices = all_indices[train_count:]
     return train_indices, val_indices
+
+
+def _video_key_from_filename(video_filename: str) -> str:
+    """Map ``65-1.mp4`` to the compact key ``65_1``."""
+    stem = Path(video_filename).stem
+    subject_id, separator, day = stem.partition("-")
+    if separator:
+        return f"{subject_id}_{day}"
+    return stem.replace("-", "_")
+
+
+def _video_filename_from_key(video_key: str) -> str:
+    """Map ``65_1`` to ``65-1.mp4``."""
+    normalized = video_key.strip()
+    if normalized.endswith(".mp4"):
+        return normalized
+    subject_id, separator, day = normalized.partition("_")
+    if separator:
+        return f"{subject_id}-{day}.mp4"
+    return f"{normalized}.mp4"
+
+
+def split_train_val_indices_by_video(
+    dataset: AphasiaGestureSegmentDataset,
+    *,
+    fixed_train_video_keys: frozenset[str] | set[str],
+    fixed_val_video_keys: frozenset[str] | set[str],
+    train_fraction: float = 0.8,
+    seed: int = 42,
+) -> tuple[list[int], list[int], dict[str, list[str]]]:
+    """
+    Split gesture samples by video, keeping fixed train/val videos and randomly
+    assigning the remaining videos.
+    """
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError(
+            f"train_fraction must be between 0 and 1, got {train_fraction}"
+        )
+
+    overlap = set(fixed_train_video_keys) & set(fixed_val_video_keys)
+    if overlap:
+        raise ValueError(
+            "Fixed train and val video keys overlap: "
+            + ", ".join(sorted(overlap))
+        )
+
+    video_to_indices: dict[str, list[int]] = defaultdict(list)
+    for index, sample in enumerate(dataset.samples):
+        video_to_indices[sample.video_filename].append(index)
+
+    available_keys = {
+        _video_key_from_filename(video_filename)
+        for video_filename in video_to_indices
+    }
+
+    missing_fixed_train = sorted(fixed_train_video_keys - available_keys)
+    missing_fixed_val = sorted(fixed_val_video_keys - available_keys)
+    if missing_fixed_train:
+        print(
+            "Warning: fixed train videos not found in dataset: "
+            + ", ".join(missing_fixed_train)
+        )
+    if missing_fixed_val:
+        print(
+            "Warning: fixed val videos not found in dataset: "
+            + ", ".join(missing_fixed_val)
+        )
+
+    train_video_filenames: set[str] = set()
+    val_video_filenames: set[str] = set()
+
+    for video_key in fixed_train_video_keys:
+        video_filename = _video_filename_from_key(video_key)
+        if video_filename in video_to_indices:
+            train_video_filenames.add(video_filename)
+
+    for video_key in fixed_val_video_keys:
+        video_filename = _video_filename_from_key(video_key)
+        if video_filename in video_to_indices:
+            val_video_filenames.add(video_filename)
+
+    remaining_video_filenames = sorted(
+        video_filename
+        for video_filename in video_to_indices
+        if video_filename not in train_video_filenames
+        and video_filename not in val_video_filenames
+    )
+
+    if len(remaining_video_filenames) >= 2:
+        rng = random.Random(seed)
+        rng.shuffle(remaining_video_filenames)
+        remaining_train_count = int(len(remaining_video_filenames) * train_fraction)
+        if remaining_train_count < 1:
+            remaining_train_count = 1
+        elif remaining_train_count >= len(remaining_video_filenames):
+            remaining_train_count = len(remaining_video_filenames) - 1
+
+        train_video_filenames.update(
+            remaining_video_filenames[:remaining_train_count]
+        )
+        val_video_filenames.update(
+            remaining_video_filenames[remaining_train_count:]
+        )
+    elif len(remaining_video_filenames) == 1:
+        train_video_filenames.add(remaining_video_filenames[0])
+
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    for video_filename in sorted(train_video_filenames):
+        train_indices.extend(video_to_indices[video_filename])
+    for video_filename in sorted(val_video_filenames):
+        val_indices.extend(video_to_indices[video_filename])
+
+    if not train_indices or not val_indices:
+        raise RuntimeError(
+            "Video-level train/val split produced an empty partition: "
+            f"train_samples={len(train_indices)}, val_samples={len(val_indices)}"
+        )
+
+    split_summary = {
+        "fixed_train_videos": sorted(
+            _video_key_from_filename(video_filename)
+            for video_filename in train_video_filenames
+            if _video_key_from_filename(video_filename) in fixed_train_video_keys
+        ),
+        "fixed_val_videos": sorted(
+            _video_key_from_filename(video_filename)
+            for video_filename in val_video_filenames
+            if _video_key_from_filename(video_filename) in fixed_val_video_keys
+        ),
+        "random_train_videos": sorted(
+            _video_key_from_filename(video_filename)
+            for video_filename in train_video_filenames
+            if _video_key_from_filename(video_filename) not in fixed_train_video_keys
+        ),
+        "random_val_videos": sorted(
+            _video_key_from_filename(video_filename)
+            for video_filename in val_video_filenames
+            if _video_key_from_filename(video_filename) not in fixed_val_video_keys
+        ),
+    }
+    return train_indices, val_indices, split_summary
 
 
 def run_sampling_sanity_check(
@@ -998,8 +1441,18 @@ def main() -> None:
     print(f"Name to index: {label_to_idx}")
     print()
 
-    train_indices, val_indices = split_train_val_indices(
+    train_indices, val_indices, split_summary = split_train_val_indices_by_video(
         dataset,
+        fixed_train_video_keys=(
+            frozenset()
+            if args.no_alignment_supervision
+            else FIXED_TRAIN_VIDEO_KEYS
+        ),
+        fixed_val_video_keys=(
+            frozenset()
+            if args.no_alignment_supervision
+            else FIXED_VAL_VIDEO_KEYS
+        ),
         train_fraction=0.8,
         seed=42,
     )
@@ -1017,7 +1470,20 @@ def main() -> None:
 
     print("Dataset loaded successfully")
     print(f"Full gesture samples: {len(dataset)}")
-    print("Split strategy: global 80/20 train/val over all gesture samples")
+    if args.no_alignment_supervision:
+        print(
+            "Split strategy: random 80/20 video split "
+            "(fixed train/val videos disabled with --no_alignment_supervision)"
+        )
+    else:
+        print(
+            "Split strategy: fixed train/val videos with random 80/20 split "
+            "for remaining videos"
+        )
+        print(f"Fixed train videos: {split_summary['fixed_train_videos']}")
+        print(f"Fixed val videos: {split_summary['fixed_val_videos']}")
+    print(f"Random train videos: {split_summary['random_train_videos']}")
+    print(f"Random val videos: {split_summary['random_val_videos']}")
     print(f"Train split samples: {len(train_indices)}")
     print(f"Val split samples: {len(val_indices)}")
     if per_video_samples is not None:
@@ -1098,13 +1564,68 @@ def main() -> None:
     sanity_transcript_chunks, sanity_transcript_chunk_mask = (
         get_batch_transcript_chunks(sanity_batch, device)
     )
-    sanity_logits = model(
-        sanity_landmarks,
-        transcript_chunks=sanity_transcript_chunks,
-        transcript_chunk_mask=sanity_transcript_chunk_mask,
-        transcripts=sanity_transcripts,
-    )
-    sanity_loss = compute_classification_loss(sanity_logits, sanity_labels)
+    use_alignment_supervision = not args.no_alignment_supervision
+    if use_alignment_supervision:
+        sanity_alignment_targets = get_batch_alignment_targets(
+            sanity_batch,
+            device,
+            args.num_transcript_chunks,
+        )
+        (
+            sanity_logits,
+            sanity_attention_weights,
+            _sanity_modality_gate,
+            sanity_returned_chunk_mask,
+        ) = model(
+            sanity_landmarks,
+            transcript_chunks=sanity_transcript_chunks,
+            transcript_chunk_mask=sanity_transcript_chunk_mask,
+            transcripts=sanity_transcripts,
+            return_attention=True,
+        )
+        if sanity_returned_chunk_mask is None:
+            sanity_returned_chunk_mask = sanity_transcript_chunk_mask
+        sanity_classification_loss = compute_classification_loss(
+            sanity_logits,
+            sanity_labels,
+        )
+        sanity_alignment_loss, sanity_num_annotated, sanity_mean_attention = (
+            compute_masked_alignment_loss(
+                sanity_attention_weights,
+                sanity_alignment_targets,
+                sanity_returned_chunk_mask,
+                label_smoothing=args.alignment_label_smoothing,
+            )
+        )
+        sanity_effective_alignment_weight = (
+            args.alignment_loss_weight
+            * alignment_warmup_factor(1, args.alignment_warmup_epochs)
+        )
+        sanity_combined_loss = (
+            sanity_classification_loss
+            + sanity_effective_alignment_weight * sanity_alignment_loss
+        )
+        sanity_target_probability = compute_alignment_target_probability(
+            sanity_mean_attention,
+            sanity_alignment_targets,
+        )
+    else:
+        sanity_logits = model(
+            sanity_landmarks,
+            transcript_chunks=sanity_transcript_chunks,
+            transcript_chunk_mask=sanity_transcript_chunk_mask,
+            transcripts=sanity_transcripts,
+            return_attention=False,
+        )
+        sanity_classification_loss = compute_classification_loss(
+            sanity_logits,
+            sanity_labels,
+        )
+        sanity_alignment_loss = sanity_logits.new_tensor(0.0)
+        sanity_num_annotated = 0
+        sanity_effective_alignment_weight = 0.0
+        sanity_combined_loss = sanity_classification_loss
+        sanity_target_probability = sanity_logits.new_tensor(0.0)
 
     print("One-batch sanity check:")
     print(f"  landmarks shape: {tuple(sanity_landmarks.shape)}")
@@ -1114,12 +1635,29 @@ def main() -> None:
     if sanity_transcripts:
         preview = sanity_transcripts[0].replace("\n", " ")[:120]
         print(f"  first transcript preview: {preview!r}")
+    if use_alignment_supervision:
+        print(f"  alignment target shape: {tuple(sanity_alignment_targets.shape)}")
+        print(f"  attention shape: {tuple(sanity_attention_weights.shape)}")
+        print(f"  annotated alignment samples: {sanity_num_annotated}")
+    else:
+        print("  alignment supervision: disabled")
     print(f"  logits shape: {tuple(sanity_logits.shape)}")
-    print(f"  loss: {sanity_loss.item():.4f}")
+    print(f"  classification loss: {sanity_classification_loss.item():.4f}")
+    print(f"  alignment loss: {sanity_alignment_loss.item():.4f}")
+    print(f"  effective alignment weight: {sanity_effective_alignment_weight:.4f}")
+    print(f"  combined loss: {sanity_combined_loss.item():.4f}")
+    if use_alignment_supervision:
+        print(
+            "  alignment target probability: "
+            f"{sanity_target_probability.item():.4f}"
+        )
     print()
 
     best_val_acc = 0.0
     val_misclassification_counts: dict[str, int] = defaultdict(int)
+    init_results_per_epoch_csv(RESULTS_PER_EPOCH_PATH)
+    print(f"Per-epoch metrics CSV: {RESULTS_PER_EPOCH_PATH}")
+    print()
 
     for epoch in range(1, NUM_EPOCHS + 1):
         if hasattr(train_dataset, "resample_epoch"):
@@ -1131,7 +1669,7 @@ def main() -> None:
                     f"per_video_samples={per_video_samples})"
                 )
 
-        train_loss, train_metrics = train_one_epoch(
+        train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -1139,24 +1677,46 @@ def main() -> None:
             label_to_idx=label_to_idx,
             num_classes=num_classes,
             idx_to_label=idx_to_label,
+            epoch=epoch,
+            expected_num_chunks=args.num_transcript_chunks,
+            alignment_loss_weight=args.alignment_loss_weight,
+            alignment_label_smoothing=args.alignment_label_smoothing,
+            alignment_warmup_epochs=args.alignment_warmup_epochs,
+            use_alignment_supervision=use_alignment_supervision,
         )
-        val_loss, val_metrics = validate_one_epoch(
+        val_metrics = validate_one_epoch(
             model=model,
             loader=val_loader,
             device=device,
             label_to_idx=label_to_idx,
             num_classes=num_classes,
             idx_to_label=idx_to_label,
+            expected_num_chunks=args.num_transcript_chunks,
+            alignment_loss_weight=args.alignment_loss_weight,
+            alignment_label_smoothing=args.alignment_label_smoothing,
+            alignment_warmup_epochs=args.alignment_warmup_epochs,
+            epoch=epoch,
+            use_alignment_supervision=use_alignment_supervision,
             misclassification_counts=val_misclassification_counts,
         )
 
         print(
             f"Epoch {epoch:03d}/{NUM_EPOCHS:03d} | "
-            f"train loss {train_loss:.4f} | train acc {train_metrics['accuracy']:.4f} | "
+            f"train total loss {train_metrics['total_loss']:.4f} | "
+            f"train cls loss {train_metrics['classification_loss']:.4f} | "
+            f"train align loss {train_metrics['alignment_loss']:.4f} | "
+            f"train annotated {int(train_metrics['annotated_alignment_samples'])} | "
+            f"train align prob {train_metrics['alignment_target_probability']:.4f} | "
+            f"train acc {train_metrics['accuracy']:.4f} | "
             f"train precision {train_metrics['precision']:.4f} | "
             f"train recall {train_metrics['recall']:.4f} | "
             f"train f1 {train_metrics['f1']:.4f} | "
-            f"val loss {val_loss:.4f} | val acc {val_metrics['accuracy']:.4f} | "
+            f"val total loss {val_metrics['total_loss']:.4f} | "
+            f"val cls loss {val_metrics['classification_loss']:.4f} | "
+            f"val align loss {val_metrics['alignment_loss']:.4f} | "
+            f"val annotated {int(val_metrics['annotated_alignment_samples'])} | "
+            f"val align prob {val_metrics['alignment_target_probability']:.4f} | "
+            f"val acc {val_metrics['accuracy']:.4f} | "
             f"val precision {val_metrics['precision']:.4f} | "
             f"val recall {val_metrics['recall']:.4f} | "
             f"val f1 {val_metrics['f1']:.4f}"
@@ -1164,6 +1724,12 @@ def main() -> None:
         print_per_class_accuracy(
             val_metrics,
             prefix="Per-class val accuracy:",
+        )
+        append_results_per_epoch_row(
+            RESULTS_PER_EPOCH_PATH,
+            epoch=epoch,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
         )
         print()
 
@@ -1177,6 +1743,11 @@ def main() -> None:
                     "val_acc": val_metrics["accuracy"],
                     "label_to_idx": label_to_idx,
                     "idx_to_label": idx_to_label,
+                    "alignment_loss_weight": args.alignment_loss_weight,
+                    "alignment_label_smoothing": args.alignment_label_smoothing,
+                    "alignment_warmup_epochs": args.alignment_warmup_epochs,
+                    "no_alignment_supervision": args.no_alignment_supervision,
+                    "num_transcript_chunks": args.num_transcript_chunks,
                 },
                 BEST_MODEL_PATH,
             )
@@ -1184,6 +1755,7 @@ def main() -> None:
     print()
     print(f"Best validation accuracy: {best_val_acc:.4f}")
     print(f"Saved best model to: {BEST_MODEL_PATH}")
+    print(f"Saved per-epoch metrics to: {RESULTS_PER_EPOCH_PATH}")
     print()
     print_top_misclassified_val_samples(
         val_misclassification_counts,

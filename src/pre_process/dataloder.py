@@ -521,6 +521,237 @@ def _build_transcript_chunks(
     return chunks, torch.tensor(mask_values, dtype=torch.bool)
 
 
+CLAN_MEDIA_TIMESTAMP_RE = re.compile(
+    r"^(?P<hours>\d+):(?P<minutes>\d{2}):(?P<seconds>\d{2})\.(?P<milliseconds>\d+)$"
+)
+UTTERANCE_ALIGNMENT_MARKER_RE = re.compile(r"<+\+?utt_[se]>", re.IGNORECASE)
+WHITESPACE_RE = re.compile(r"\s+")
+
+GESTURE_TEXT_ALIGNMENT_FIELDS = (
+    "aligned_utt_start_ts",
+    "aligned_utt_end_ts",
+    "aligned_utterance",
+    "full_transcript",
+)
+
+DEBUG_GETITEM_VIDEO_SUBJECT_IDS = frozenset(
+    {
+        "65",
+        "81",
+        "92",
+        "101",
+        "104",
+        "105",
+        "122",
+        "123",
+        "128",
+        "133",
+        "171",
+        "202",
+        "208",
+    }
+)
+
+
+def _parse_media_timestamp_to_ms(timestamp: str) -> int:
+    """Parse ``HH:MM:SS.mmm`` media timestamps used in alignment annotations."""
+    match = CLAN_MEDIA_TIMESTAMP_RE.match(str(timestamp).strip())
+    if match is None:
+        raise ValueError(f"Invalid media timestamp: {timestamp!r}")
+
+    hours = int(match.group("hours"))
+    minutes = int(match.group("minutes"))
+    seconds = int(match.group("seconds"))
+    milliseconds = int(match.group("milliseconds"))
+    return ((hours * 3600) + (minutes * 60) + seconds) * 1000 + milliseconds
+
+
+def _empty_gesture_text_alignment() -> dict[str, None]:
+    return {field: None for field in GESTURE_TEXT_ALIGNMENT_FIELDS}
+
+
+def _clean_alignment_transcript_markers(text: str) -> str:
+    """Remove CLAN utterance boundary markers from alignment transcript text."""
+    return UTTERANCE_ALIGNMENT_MARKER_RE.sub("", str(text))
+
+
+def _normalize_alignment_match_text(text: str) -> str:
+    """Normalize transcript text for substring-based alignment matching."""
+    cleaned = _clean_alignment_transcript_markers(text)
+    normalized_lines: list[str] = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ": " in line:
+            _, _, content = line.partition(": ")
+            normalized_lines.append(content.strip())
+        else:
+            normalized_lines.append(line)
+    joined = " ".join(normalized_lines)
+    return WHITESPACE_RE.sub(" ", joined.strip().lower())
+
+
+def _normalize_transcript_chunk_for_match(chunk: str) -> str:
+    return _normalize_alignment_match_text(str(chunk))
+
+
+def _find_best_aligned_transcript_chunk_index(
+    transcript_chunks: Sequence[str],
+    *,
+    full_transcript: str,
+    aligned_utterance: str,
+) -> int | None:
+    """
+    Find the longest transcript chunk whose normalized text is contained in
+    ``full_transcript`` and also contains ``aligned_utterance``.
+    """
+    normalized_full = _normalize_alignment_match_text(full_transcript)
+    normalized_utterance = _normalize_alignment_match_text(aligned_utterance)
+    if not normalized_full or not normalized_utterance:
+        return None
+
+    best_index: int | None = None
+    best_match_length = -1
+
+    for chunk_index, chunk in enumerate(transcript_chunks):
+        normalized_chunk = _normalize_transcript_chunk_for_match(chunk)
+        if not normalized_chunk:
+            continue
+        if normalized_chunk not in normalized_full:
+            continue
+        if normalized_utterance not in normalized_chunk:
+            continue
+        if len(normalized_chunk) > best_match_length:
+            best_match_length = len(normalized_chunk)
+            best_index = chunk_index
+
+    return best_index
+
+
+def _build_transcript_alignment_mask(
+    transcript_chunks: Sequence[str],
+    *,
+    full_transcript: str | None,
+    aligned_utterance: str | None,
+) -> torch.Tensor:
+    """Return a one-hot chunk mask marking the best alignment match, else zeros."""
+    num_chunks = len(transcript_chunks)
+    alignment_mask = torch.zeros(num_chunks, dtype=torch.float32)
+    if not full_transcript or not aligned_utterance:
+        return alignment_mask
+
+    match_index = _find_best_aligned_transcript_chunk_index(
+        transcript_chunks,
+        full_transcript=full_transcript,
+        aligned_utterance=aligned_utterance,
+    )
+    if match_index is not None:
+        alignment_mask[match_index] = 1.0
+    return alignment_mask
+
+
+def _extract_gesture_text_alignment_fields(
+    alignment_entry: dict[str, Any],
+) -> dict[str, str]:
+    fields = {
+        field: str(alignment_entry[field])
+        for field in GESTURE_TEXT_ALIGNMENT_FIELDS
+    }
+    if fields["full_transcript"] is not None:
+        fields["full_transcript"] = _clean_alignment_transcript_markers(
+            fields["full_transcript"]
+        )
+    return fields
+
+
+def _find_gesture_text_alignment(
+    alignment_entries: Sequence[dict[str, Any]],
+    *,
+    annotation_id: str | None,
+) -> dict[str, str] | None:
+    """Return alignment text fields when ``annotation_id`` matches an entry."""
+    if annotation_id is None:
+        return None
+
+    normalized_id = str(annotation_id).strip()
+    if not normalized_id:
+        return None
+
+    matching_entries = [
+        entry
+        for entry in alignment_entries
+        if str(entry.get("annotation_id", "")).strip() == normalized_id
+    ]
+    if not matching_entries:
+        return None
+
+    if len(matching_entries) > 1:
+        warnings.warn(
+            f"Multiple alignment entries share annotation_id {normalized_id!r}; "
+            "using the first match.",
+            stacklevel=2,
+        )
+
+    return _extract_gesture_text_alignment_fields(matching_entries[0])
+
+
+def _resolve_alignment_anns_path(
+    alignment_anns_dir: Path,
+    video_filename: str,
+) -> Path | None:
+    video_stem = Path(video_filename).stem
+    candidate = alignment_anns_dir / f"{video_stem}_anns.json"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _scan_alignment_anns_dir(alignment_anns_dir: Path) -> dict[str, Path]:
+    """Map ``video_filename`` values to alignment JSON paths."""
+    if not alignment_anns_dir.is_dir():
+        warnings.warn(
+            f"Alignment annotation directory does not exist: {alignment_anns_dir}. "
+            "Gesture-text alignment fields will be empty.",
+            stacklevel=2,
+        )
+        return {}
+
+    index: dict[str, Path] = {}
+    for path in sorted(alignment_anns_dir.glob("*_anns.json")):
+        if not path.is_file():
+            continue
+        video_stem = path.name[: -len("_anns.json")]
+        video_filename = f"{video_stem}.mp4"
+        index[video_filename] = path
+    return index
+
+
+def _load_alignment_anns_payload(
+    alignment_path: Path,
+    *,
+    expected_video_filename: str,
+) -> list[dict[str, Any]]:
+    with alignment_path.open(encoding="utf-8") as input_file:
+        payload = json.load(input_file)
+
+    payload_video_filename = str(payload.get("video_filename", "")).strip()
+    if payload_video_filename != expected_video_filename:
+        raise ValueError(
+            "Alignment annotation video_filename mismatch for "
+            f"{alignment_path.name}: expected {expected_video_filename!r}, "
+            f"got {payload_video_filename!r}"
+        )
+
+    annotations = payload.get("annotations")
+    if not isinstance(annotations, list):
+        raise ValueError(
+            f"Alignment annotation file {alignment_path} is missing an "
+            "'annotations' list."
+        )
+    return annotations
+
+
 def parse_segment_annotation_file(annotation_path: Path) -> dict:
     """Parse a gesture-segment ``annotation.txt`` file written by extraction."""
     metadata: dict = {}
@@ -1637,6 +1868,12 @@ class AphasiaGestureSegmentDataset(Dataset):
     - ``transcript_chunks``: list of ``num_transcript_chunks`` transcript strings
     - ``transcript_chunk_mask``: bool tensor ``[num_transcript_chunks]``
     - ``transcript``: joined non-empty chunk text (legacy/debug convenience)
+    - ``aligned_utt_start_ts``: aligned utterance start timestamp when available
+    - ``aligned_utt_end_ts``: aligned utterance end timestamp when available
+    - ``aligned_utterance``: aligned utterance text when available
+    - ``full_transcript``: full aligned transcript snippet when available
+    - ``transcript_alignment_mask``: float tensor ``[num_transcript_chunks]`` with
+      ``1.0`` on the chunk best matching the aligned utterance and ``0.0`` elsewhere
     - ``label``: ``0`` or ``1``
     - ``gesture_type``: ``NEG`` or ``POS``
     - ``annotation``: segment metadata
@@ -1653,6 +1890,9 @@ class AphasiaGestureSegmentDataset(Dataset):
     DEFAULT_NEGATIVE_LANDMARKS_ROOT = (
         "/data/quantization/zaima/aphasiabank/neural2/control/neg_gest_segments_landmarks"
     )
+    DEFAULT_ALIGNMENT_ANNS_DIR = (
+        "/data/quantization/zaima/aphasiabank/neural2/control/ts_videos/alignment_anns"
+    )
 
     def __init__(
         self,
@@ -1664,7 +1904,7 @@ class AphasiaGestureSegmentDataset(Dataset):
         strict: bool = False,
         strict_transcripts: bool | None = None,
         transcript_kwargs: dict | None = None,
-        transcript_offset_seconds: float = 3.0,
+        transcript_offset_seconds: float = 4.0,
         num_transcript_chunks: int = 5,
         num_frames: int | None = None,
         frame_size: tuple[int, int] | None = None,
@@ -1734,6 +1974,14 @@ class AphasiaGestureSegmentDataset(Dataset):
             tuple[list[str], torch.Tensor],
         ] = {}
 
+        self.alignment_anns_dir = Path(
+            self.DEFAULT_ALIGNMENT_ANNS_DIR
+        ).expanduser().resolve()
+        self._alignment_anns_by_video = _scan_alignment_anns_dir(self.alignment_anns_dir)
+        self._alignment_anns_payload_cache: dict[str, list[dict[str, Any]]] = {}
+        self._missing_alignment_warned: set[str] = set()
+        self._alignment_mismatch_warned: set[str] = set()
+
         if self.transcript_dir is not None:
             if not self.transcript_dir.is_dir():
                 raise FileNotFoundError(
@@ -1790,6 +2038,11 @@ class AphasiaGestureSegmentDataset(Dataset):
         view._transcript_lookup_warned = dataset._transcript_lookup_warned
         view._missing_transcript_warned = dataset._missing_transcript_warned
         view._transcript_cache = dataset._transcript_cache
+        view.alignment_anns_dir = dataset.alignment_anns_dir
+        view._alignment_anns_by_video = dataset._alignment_anns_by_video
+        view._alignment_anns_payload_cache = dataset._alignment_anns_payload_cache
+        view._missing_alignment_warned = dataset._missing_alignment_warned
+        view._alignment_mismatch_warned = dataset._alignment_mismatch_warned
         view.num_frames = dataset.num_frames
         view.frame_size = dataset.frame_size
         view.rgb = dataset.rgb
@@ -1848,6 +2101,13 @@ class AphasiaGestureSegmentDataset(Dataset):
     def __getitem__(self, index: int) -> dict:
         real_index = self.active_indices[index]
         sample = self.samples[real_index]
+        # video_key = _parse_video_filename_key(sample.video_filename)
+        # if (
+        #     video_key is not None
+        #     and video_key.subject_id in DEBUG_GETITEM_VIDEO_SUBJECT_IDS
+        # ):
+            # print(sample.video_filename)
+
         landmarks = self._read_segment_landmarks(sample.landmarks_path)
         transcript_chunks, transcript_chunk_mask = self._extract_segment_transcript_chunks(
             sample
@@ -1855,16 +2115,74 @@ class AphasiaGestureSegmentDataset(Dataset):
         transcript = "\n".join(
             chunk for chunk in transcript_chunks if str(chunk).strip()
         )
+        gesture_text_alignment = self._extract_gesture_text_alignment(sample)
+        transcript_alignment_mask = _build_transcript_alignment_mask(
+            transcript_chunks,
+            full_transcript=gesture_text_alignment.get("full_transcript"),
+            aligned_utterance=gesture_text_alignment.get("aligned_utterance"),
+        )
 
         return {
             "landmarks": landmarks,
             "transcript_chunks": transcript_chunks,
             "transcript_chunk_mask": transcript_chunk_mask,
             "transcript": transcript,
+            "transcript_alignment_mask": transcript_alignment_mask,
+            **gesture_text_alignment,
             "label": sample.label,
             "gesture_type": sample.label_name,
             "annotation": sample.annotation,
         }
+
+    def _get_alignment_entries_for_video(
+        self,
+        video_filename: str,
+    ) -> list[dict[str, Any]] | None:
+        alignment_path = self._alignment_anns_by_video.get(video_filename)
+        if alignment_path is None:
+            alignment_path = _resolve_alignment_anns_path(
+                self.alignment_anns_dir,
+                video_filename,
+            )
+            if alignment_path is None:
+                return None
+            self._alignment_anns_by_video[video_filename] = alignment_path
+
+        cached = self._alignment_anns_payload_cache.get(video_filename)
+        if cached is not None:
+            return cached
+
+        try:
+            annotations = _load_alignment_anns_payload(
+                alignment_path,
+                expected_video_filename=video_filename,
+            )
+        except ValueError as exc:
+            warning_key = f"{video_filename}:{alignment_path.name}"
+            if warning_key not in self._alignment_mismatch_warned:
+                warnings.warn(str(exc), stacklevel=2)
+                self._alignment_mismatch_warned.add(warning_key)
+            return None
+
+        self._alignment_anns_payload_cache[video_filename] = annotations
+        return annotations
+
+    def _extract_gesture_text_alignment(
+        self,
+        sample: GestureSegmentSample,
+    ) -> dict[str, str | None]:
+        alignment_entries = self._get_alignment_entries_for_video(sample.video_filename)
+        if alignment_entries is None:
+            return _empty_gesture_text_alignment()
+
+        annotation_id = sample.annotation.get("annotation_id")
+        matched = _find_gesture_text_alignment(
+            alignment_entries,
+            annotation_id=annotation_id,
+        )
+        if matched is None:
+            return _empty_gesture_text_alignment()
+        return matched
 
     def _resolve_transcript_path(self, video_filename: str) -> Path | None:
         if self.transcript_dir is None:
@@ -1940,17 +2258,17 @@ class AphasiaGestureSegmentDataset(Dataset):
             if self.transcript_dir is None:
                 return empty_chunks, empty_mask
 
-            warning_key = sample.video_filename.lower()
-            message = (
-                f"No CHAT transcript found for video {sample.video_filename!r} "
-                f"(segment {sample.segment_dir})"
-            )
-            if self.strict_transcripts:
-                raise ValueError(message)
+            # warning_key = sample.video_filename.lower()
+            # message = (
+            #     f"No CHAT transcript found for video {sample.video_filename!r} "
+            #     f"(segment {sample.segment_dir})"
+            # )
+            # if self.strict_transcripts:
+            #     raise ValueError(message)
 
-            if warning_key not in self._missing_transcript_warned:
-                warnings.warn(message, stacklevel=2)
-                self._missing_transcript_warned.add(warning_key)
+            # if warning_key not in self._missing_transcript_warned:
+            #     warnings.warn(message, stacklevel=2)
+            #     self._missing_transcript_warned.add(warning_key)
             return empty_chunks, empty_mask
 
         try:
