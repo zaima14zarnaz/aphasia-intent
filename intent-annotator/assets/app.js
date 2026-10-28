@@ -292,8 +292,13 @@ function bindWorkspace() {
     }
     const saved = annotation(); saved.completed = true; saved.updated_at = new Date().toISOString(); responses.set(current().id, saved);
     const stored = persist(); updateProgress();
-    if (stored) notice(clips.every(clip => annotation(clip.id).completed) ? 'All clips are complete. Export your annotations from “Annotation files” above.' : 'Clip marked complete. Continue with the next clip when you are ready.');
+    if (stored && clips.every(clip => annotation(clip.id).completed)) {
+      notice('All clips are complete. Export your annotations from “Annotation files” above.');
+    } else {
+      notice('');
+    }
   });
+
   $('export-json').addEventListener('click', () => download(JSON.stringify(exportPayload(), null, 2), 'json', 'application/json'));
   $('export-csv').addEventListener('click', () => { const payload = exportPayload(); download(toCSV(payload.annotations, payload.annotator_id), 'csv', 'text/csv;charset=utf-8'); });
   $('import-json').addEventListener('change', async event => {
