@@ -8,7 +8,7 @@
     "role": "Reinforce information already available in transcript."
   },
   "clips": [
-    {"id":"example:01","title":"Clip 01","filename":"Example clip 01","src":"","task":"Placeholder task — describe an everyday event.","transcript":"[Placeholder transcript] I gave it to her, and then she put it over there.","placeholder_context":true},
+    {"id":"example:01","title":"Clip 01","filename":"Example clip 01","src":"","task":"Sandwich task.","transcript":"[Placeholder transcript] I gave it to her, and then she put it over there.","placeholder_context":true},
     {"id":"example:02","title":"Clip 02","filename":"Example clip 02","src":"","task":"Placeholder task — retell a short story.","transcript":"[Placeholder transcript] He was walking along, and then he turned around.","placeholder_context":true},
     {"id":"example:03","title":"Clip 03","filename":"Example clip 03","src":"","task":"Placeholder task — explain a familiar activity.","transcript":"[Placeholder transcript] You take this one and put it on top.","placeholder_context":true}
   ]
