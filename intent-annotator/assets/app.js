@@ -106,7 +106,10 @@ function persist() {
 }
 
 function writeExamples() {
-  for (const key of FIELDS) $(key).placeholder = examples[key] || '';
+  for (const key of FIELDS) {
+    const text = (examples[key] || '').trim();
+    $(key).placeholder = text ? `Example: ${text}` : '';
+  }
 }
 
 function buildRoles() {
