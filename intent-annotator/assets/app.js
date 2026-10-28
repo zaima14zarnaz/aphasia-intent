@@ -3,7 +3,7 @@ import {createAccount, signIn, signOut, getSession, responseStorageKey, isValidE
 
 const $ = id => document.getElementById(id);
 let clips = [], index = 0, examples = {...EXAMPLES};
-let responses = new Map(), folderURLs = [], storageBlocked = false;
+let responses = new Map(), storageBlocked = false;
 let storageMessage = '';
 let session = null;
 let authMode = 'create';
@@ -106,11 +106,7 @@ function persist() {
 }
 
 function writeExamples() {
-  for (const key of [...FIELDS, 'role']) {
-    const node = $(key + '-example');
-    const label = document.createElement('strong'); label.textContent = 'Example: ';
-    node.replaceChildren(label, document.createTextNode(examples[key]));
-  }
+  for (const key of FIELDS) $(key).placeholder = examples[key] || '';
 }
 
 function buildRoles() {
@@ -175,7 +171,7 @@ function updateProgress() {
   $('clip-state').classList.toggle('complete', saved.completed);
   $('complete').textContent = saved.completed ? 'Clip complete ✓' : 'Mark clip complete ✓';
   $('complete').disabled = saved.completed;
-  $('completion-help').textContent = saved.completed ? 'This clip is complete. Editing a response reopens it for review.' : 'Example lines are guidance only and are not saved as responses.';
+  $('completion-help').textContent = saved.completed ? 'This clip is complete. Editing a response reopens it for review.' : 'Placeholder text is guidance only and is not saved as a response.';
 }
 
 function saveForm() {
@@ -208,7 +204,7 @@ function selectClip(target, focus = false) {
   $('video-message').hidden = true;
   video.removeAttribute('src');
   if (clip.src) { video.src = clip.src; $('replay').disabled = false; }
-  else { showVideoMessage('Your video goes here', 'Choose your video folder above, or prepare clips using the included script.'); $('replay').disabled = true; }
+  else { showVideoMessage('Video unavailable', 'This clip has no playable video source.'); $('replay').disabled = true; }
   video.load(); video.playbackRate = Number($('playback-speed').value);
   $('clip-position').textContent = `Clip ${index + 1} of ${clips.length}`;
   $('bottom-position').textContent = `${index + 1} / ${clips.length}`;
@@ -260,22 +256,12 @@ async function loadClips() {
     const response = await fetch('data/clips.json', {cache: 'no-store'});
     if (!response.ok) throw new Error(`Clip list returned HTTP ${response.status}.`);
     const manifest = await response.json();
-    if (manifest.examples && typeof manifest.examples === 'object') for (const key of [...FIELDS, 'role']) if (typeof manifest.examples[key] === 'string') examples[key] = manifest.examples[key];
+    if (manifest.examples && typeof manifest.examples === 'object') for (const key of FIELDS) if (typeof manifest.examples[key] === 'string') examples[key] = manifest.examples[key];
     writeExamples(); setClips(normalizeManifest(manifest));
-    if (!clips.length) {
-      $('setup-title').textContent = 'No clips configured yet';
-      $('setup-message').textContent = 'Choose your video folder, or run scripts/prepare_clips.py to build the clip list.';
-    } else if (clips.every(clip => !clip.src)) {
-      $('setup-title').textContent = 'Example workspace · add your clips to begin';
-      $('setup-message').textContent = 'These tabs show the layout. Choose a video folder, or run the included preparation script for your server directory.';
-    } else {
-      $('setup-title').textContent = `${clips.length} clips ready for annotation`;
-      $('setup-message').textContent = 'Watch each clip, enter your responses, and mark it complete. Export your annotations when finished.';
-    }
+    if (!clips.length) notice('No clips are configured in data/clips.json.');
+    else if (clips.every(clip => !clip.src)) notice('Clips are listed, but none have a playable video source yet.');
     if (storageBlocked) notice(storageMessage);
   } catch (error) {
-    $('setup-title').textContent = 'Load your video clips';
-    $('setup-message').textContent = 'Choose a local video folder to begin, or check data/clips.json.';
     notice('Could not load the clip list: ' + error.message + ' Run this site through an HTTP server, rather than opening index.html directly.');
   }
 }
@@ -284,15 +270,15 @@ function bindWorkspace() {
   if (workspaceReady) return;
   workspaceReady = true;
   buildRoles();
+  writeExamples();
   for (const key of FIELDS) $(key).addEventListener('input', saveForm);
-  $('choose-folder').addEventListener('click', () => $('video-folder').click());
   $('import-button').addEventListener('click', () => $('import-json').click());
   $('previous').addEventListener('click', () => selectClip(index - 1));
   $('next').addEventListener('click', () => selectClip(index + 1));
   $('playback-speed').addEventListener('change', () => { video.playbackRate = Number($('playback-speed').value); });
   $('replay').addEventListener('click', () => { video.currentTime = 0; video.play().catch(() => notice('Playback could not start. Try the video controls or check that the file is supported.')); });
   video.addEventListener('error', () => {
-    if (current()?.src) showVideoMessage('This video could not be loaded', 'Check that the clip is available and uses a browser-supported MP4 codec. You can also choose its local folder above.');
+    if (current()?.src) showVideoMessage('This video could not be loaded', 'Check that the clip is available and uses a browser-supported MP4 codec.');
   });
   video.addEventListener('loadedmetadata', () => { $('video-message').hidden = true; video.playbackRate = Number($('playback-speed').value); });
   $('annotation-form').addEventListener('submit', event => {
@@ -318,22 +304,6 @@ function bindWorkspace() {
       notice(`Imported ${parsed.records.size} matching clip annotations.${parsed.ignored ? ` Ignored ${parsed.ignored} records from other clip sets.` : ''}${stored ? '' : ' Browser saving is unavailable; export JSON before closing this tab.'}`);
     } catch (error) { notice('Import failed: ' + error.message); }
     finally { event.target.value = ''; }
-  });
-  $('video-folder').addEventListener('change', event => {
-    const files = [...event.target.files].filter(file => /\.mp4$/i.test(file.name)).sort((a, b) => a.webkitRelativePath.localeCompare(b.webkitRelativePath, undefined, {numeric: true}));
-    if (!files.length) { notice('No MP4 videos were found in that folder. The existing clip set is unchanged.'); return; }
-    video.pause(); video.removeAttribute('src'); video.load(); folderURLs.forEach(url => URL.revokeObjectURL(url)); folderURLs = [];
-    const metadata = new Map(clips.map(clip => [clip.id, clip]));
-    const next = files.map((file, i) => {
-      const relative = file.webkitRelativePath.split('/').slice(1).join('/') || file.name;
-      const src = URL.createObjectURL(file); folderURLs.push(src);
-      return {...metadata.get(relative), id: relative, filename: relative, title: metadata.get(relative)?.title || `Clip ${String(i + 1).padStart(2, '0')}`, src, task: metadata.get(relative)?.task || 'Placeholder task — replace with the video task name.', transcript: metadata.get(relative)?.transcript || 'Placeholder transcript — replace with the written transcript.', placeholder_context: metadata.get(relative)?.placeholder_context ?? true};
-    });
-    setClips(next);
-    $('setup-title').textContent = `${files.length} local video clips loaded`;
-    $('setup-message').textContent = 'Clips stay on this device. Choose the same folder after reopening; saved responses will reconnect by filename.';
-    notice(storageBlocked ? storageMessage : 'Local clips are ready. Responses save automatically in this browser. Export them when finished.');
-    event.target.value = '';
   });
   window.addEventListener('storage', event => {
     if (!session) return;

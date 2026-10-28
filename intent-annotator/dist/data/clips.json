@@ -1,0 +1,282 @@
+{
+  "schema_version": 1,
+  "clips": [
+    {
+      "id": "81-1_13_REF.mp4",
+      "title": "Clip 01",
+      "filename": "81-1_13_REF.mp4",
+      "src": "videos/81-1_13_REF.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "81-1_18_EN.mp4",
+      "title": "Clip 02",
+      "filename": "81-1_18_EN.mp4",
+      "src": "videos/81-1_18_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "81-1_34_EN.mp4",
+      "title": "Clip 03",
+      "filename": "81-1_34_EN.mp4",
+      "src": "videos/81-1_34_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "81-1_48_EN.mp4",
+      "title": "Clip 04",
+      "filename": "81-1_48_EN.mp4",
+      "src": "videos/81-1_48_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "81-1_53_EN.mp4",
+      "title": "Clip 05",
+      "filename": "81-1_53_EN.mp4",
+      "src": "videos/81-1_53_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_1_EN.mp4",
+      "title": "Clip 06",
+      "filename": "90-1_1_EN.mp4",
+      "src": "videos/90-1_1_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_2_EN.mp4",
+      "title": "Clip 07",
+      "filename": "90-1_2_EN.mp4",
+      "src": "videos/90-1_2_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_4_EN.mp4",
+      "title": "Clip 08",
+      "filename": "90-1_4_EN.mp4",
+      "src": "videos/90-1_4_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_5_EN.mp4",
+      "title": "Clip 09",
+      "filename": "90-1_5_EN.mp4",
+      "src": "videos/90-1_5_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_6_EN.mp4",
+      "title": "Clip 10",
+      "filename": "90-1_6_EN.mp4",
+      "src": "videos/90-1_6_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_7_EN.mp4",
+      "title": "Clip 11",
+      "filename": "90-1_7_EN.mp4",
+      "src": "videos/90-1_7_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_8_REF.mp4",
+      "title": "Clip 12",
+      "filename": "90-1_8_REF.mp4",
+      "src": "videos/90-1_8_REF.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_11_HA.mp4",
+      "title": "Clip 13",
+      "filename": "90-1_11_HA.mp4",
+      "src": "videos/90-1_11_HA.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_14_EN.mp4",
+      "title": "Clip 14",
+      "filename": "90-1_14_EN.mp4",
+      "src": "videos/90-1_14_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "90-1_21_EN.mp4",
+      "title": "Clip 15",
+      "filename": "90-1_21_EN.mp4",
+      "src": "videos/90-1_21_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "92-1_1_EN.mp4",
+      "title": "Clip 16",
+      "filename": "92-1_1_EN.mp4",
+      "src": "videos/92-1_1_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "92-1_4_MIX.mp4",
+      "title": "Clip 17",
+      "filename": "92-1_4_MIX.mp4",
+      "src": "videos/92-1_4_MIX.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "92-1_11_MIX.mp4",
+      "title": "Clip 18",
+      "filename": "92-1_11_MIX.mp4",
+      "src": "videos/92-1_11_MIX.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "92-1_14_EN.mp4",
+      "title": "Clip 19",
+      "filename": "92-1_14_EN.mp4",
+      "src": "videos/92-1_14_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_1_OB.mp4",
+      "title": "Clip 20",
+      "filename": "101-1_1_OB.mp4",
+      "src": "videos/101-1_1_OB.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_5_DIC.mp4",
+      "title": "Clip 21",
+      "filename": "101-1_5_DIC.mp4",
+      "src": "videos/101-1_5_DIC.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_10_OB.mp4",
+      "title": "Clip 22",
+      "filename": "101-1_10_OB.mp4",
+      "src": "videos/101-1_10_OB.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_14_SH.mp4",
+      "title": "Clip 23",
+      "filename": "101-1_14_SH.mp4",
+      "src": "videos/101-1_14_SH.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_16_OB.mp4",
+      "title": "Clip 24",
+      "filename": "101-1_16_OB.mp4",
+      "src": "videos/101-1_16_OB.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_18_EN.mp4",
+      "title": "Clip 25",
+      "filename": "101-1_18_EN.mp4",
+      "src": "videos/101-1_18_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_22_REF.mp4",
+      "title": "Clip 26",
+      "filename": "101-1_22_REF.mp4",
+      "src": "videos/101-1_22_REF.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_27_EN.mp4",
+      "title": "Clip 27",
+      "filename": "101-1_27_EN.mp4",
+      "src": "videos/101-1_27_EN.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_34_OB.mp4",
+      "title": "Clip 28",
+      "filename": "101-1_34_OB.mp4",
+      "src": "videos/101-1_34_OB.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_36_REF.mp4",
+      "title": "Clip 29",
+      "filename": "101-1_36_REF.mp4",
+      "src": "videos/101-1_36_REF.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    },
+    {
+      "id": "101-1_38_REF.mp4",
+      "title": "Clip 30",
+      "filename": "101-1_38_REF.mp4",
+      "src": "videos/101-1_38_REF.mp4",
+      "task": "Placeholder task — replace with the video task name.",
+      "transcript": "Placeholder transcript — replace with the written transcript.",
+      "placeholder_context": true
+    }
+  ],
+  "examples": {
+    "movement": "The participant raises the right hand, opens the palm upward, and moves it forward while tilting the head slightly to the left.",
+    "meaning": "The open palm and forward movement depict offering an object to another person.",
+    "intent": "The participant is describing giving an object to someone. The transcript mentions the words 'bread' and 'sister', suggesting that the participant is giving a piece of bread to their sister. ",
+    "reasoning": "The forward hand movement suggests transfer, while the spoken words 'bread' and 'sister' in the transcript supports the interpretation of giving a piece of bread to their sister.",
+    "role": "Reinforce information already available in transcript."
+  }
+}
