@@ -1,0 +1,14 @@
+{
+  "candidate communicative intent 1": {
+    "intent": "The speaker may be instructing the listener on how to prepare a sandwich.",
+    "supporting clue": "The repeated gesture of 'spread' suggests a step-by-step process."
+  },
+  "candidate communicative intent 2": {
+    "intent": "The speaker may be explaining the action of spreading peanut butter on bread.",
+    "supporting clue": "The gesture closely matches the action described in the context."
+  },
+  "candidate communicative intent 3": {
+    "intent": "The speaker may be emphasizing the importance of spreading peanut butter evenly.",
+    "supporting clue": "The gesture's transition from open to closed could imply a focus on technique."
+  }
+}

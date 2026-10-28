@@ -1,0 +1,8 @@
+{
+  "final communicative intent": "The speaker is explaining a process involving bread and peanut butter.",
+  "evidence": {
+    "transcript": "the bread spread spread the peanut butter."
+  },
+  "reason": "The speaker uses the word 'spread' twice, indicating an action being performed on bread, followed by mentioning 'peanut butter,' suggesting a sequence of actions related to preparing a sandwich or similar food item.",
+  "uncertainty": "The exact context or purpose of the actions is not clear from the given frames and transcript alone."
+}

@@ -1,0 +1,13 @@
+{
+  "selected candidate": "candidate communicative intent 2",
+  "selected candidate intent": "The speaker may be explaining the action of spreading peanut butter on bread.",
+  "final communicative intent": "The speaker is explaining the physical action of spreading peanut butter on bread, using a gesture that visually mirrors the motion described.",
+  "evidence": {
+    "transcript": "The words 'spread' repeated with gesture support a direct explanation of the action.",
+    "gesture description": "The hand transitioning from open to closed mimics the motion of spreading, supporting a literal representation of the action.",
+    "gesture candidate meanings": "Gesture meaning candidate 1 is most directly supported: 'The gesture represents the action of spreading something, likely peanut butter.'",
+    "context and keywords": "Context of making a sandwich and keywords 'bread', 'spread', 'peanut butter' confirm the action being described."
+  },
+  "reason": "The gesture’s motion aligns most directly with the action described in the transcript and context, and candidate 2 explicitly matches this alignment without adding unsupported emphasis or instruction.",
+  "uncertainty": "The gesture’s intensity shift (open to closed) may imply technique, but no evidence confirms it is meant to emphasize evenness or instruction — it is most plausibly a literal depiction of the action."
+}

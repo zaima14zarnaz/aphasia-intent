@@ -1,0 +1,11 @@
+```json
+{
+  "Hand movement direction": "The hand moves from an open gesture to a more closed position, indicating a transition in the gesture's intensity.",
+  "Palm movement": "The palm remains relatively flat throughout the sequence, with slight adjustments in orientation.",
+  "Finger movement": "The fingers transition from being spread out to being more tightly curled, suggesting a change in the gesture's emphasis.",
+  "Notable finger shapes": "The fingers go from a more open, spread-out shape to a more closed, curled shape.",
+  "Notable palm shapes": "The palm maintains a flat position, with no significant changes in shape.",
+  "Head configuration": "The head remains mostly stationary, with minor adjustments in orientation.",
+  "Head movement": "There are slight movements of the head, possibly indicating a shift in focus or emphasis on the spoken content."
+}
+```

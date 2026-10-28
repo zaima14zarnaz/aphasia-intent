@@ -36,12 +36,17 @@ from dataloder import parse_segment_annotation_file  # noqa: E402
 from mediapipe_extractor import NUM_POSE_LANDMARKS, extract_pose_landmarks  # noqa: E402
 
 GESTURE_SEGMENT_DIR_RE = re.compile(r"^(gest|neg)_\d+$")
+DIRECT_CLIP_FILENAME_RE = re.compile(
+    r"^(?P<video_key>\d+-\d+)_(?P<gest_idx>\d+)_(?P<label>[A-Za-z]+)"
+    r"\.(?P<ext>mp4|mov|avi|mkv|webm)$",
+    re.IGNORECASE,
+)
+DIRECT_CLIP_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 DEFAULT_SOURCE_ROOT = (
-    "/data/quantization/zaima/aphasiabank/neural2/control/gest_segments"
+    "/data/quantization/zaima/aphasiabank/neural2/control/unaligned_samples/gest_clips"
 )
 DEFAULT_DEST_ROOT = (
-    "/data/quantization/zaima/aphasiabank/neural2/control/"
-    "gest_segments_landmarks/mediapipe"
+    "/data/quantization/zaima/aphasiabank/neural2/control/unaligned_samples/landmarks"
 )
 DEFAULT_NEG_SOURCE_ROOT = (
     "/data/quantization/zaima/aphasiabank/neural2/control/neg_gest_segments"
@@ -53,7 +58,7 @@ DEFAULT_NEG_DEST_ROOT = (
 LANDMARK_NAMES = ["x", "y", "z", "visibility"]
 
 # Temporary: skip MediaPipe landmark extraction and only refresh annotation.txt.
-ANNOTATION_ONLY_MODE = True
+ANNOTATION_ONLY_MODE = False
 
 POSITIVE_ANNOTATION_FIELD_ORDER = (
     "video_path",
@@ -157,6 +162,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional limit on number of segments to process (for debugging).",
+    )
+    parser.add_argument(
+        "--direct-clip-parse",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Read pre-cut gesture clip MP4 files directly from gest_clips "
+            "instead of PNG frame directories under neg_gest_segments."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -297,6 +311,68 @@ def build_landmarks_payload(
         "extractor": "mediapipe",
         "frames": frames_payload,
     }
+
+
+def discover_direct_clips(source_root: Path) -> list[tuple[Path, str, str]]:
+    """
+    Return (clip_path, video_filename, segment_name) for direct MP4 gesture clips.
+    """
+    clip_entries: list[tuple[Path, str, str]] = []
+
+    for clip_path in sorted(source_root.iterdir(), key=lambda path: path.name.lower()):
+        if not clip_path.is_file():
+            continue
+        if clip_path.suffix.lower() not in DIRECT_CLIP_VIDEO_EXTS:
+            continue
+
+        match = DIRECT_CLIP_FILENAME_RE.match(clip_path.name)
+        if match is not None:
+            video_filename = f"{match.group('video_key')}.mp4"
+            segment_name = f"gest_{match.group('gest_idx')}"
+        else:
+            video_filename = f"{clip_path.stem.split('_', 1)[0]}.mp4"
+            segment_name = clip_path.stem
+
+        clip_entries.append((clip_path, video_filename, segment_name))
+
+    return clip_entries
+
+
+def load_direct_clip_frames(clip_path: Path) -> tuple[np.ndarray, list[Path]]:
+    """Load all RGB frames from a pre-cut gesture clip MP4."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "opencv-python is required to read gesture clip MP4 files. "
+            "Install with: pip install opencv-python"
+        ) from exc
+
+    capture = cv2.VideoCapture(str(clip_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open clip: {clip_path}")
+
+    frames: list[np.ndarray] = []
+    frame_paths: list[Path] = []
+    frame_index = 0
+
+    try:
+        while True:
+            ok, frame_bgr = capture.read()
+            if not ok:
+                break
+            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            frame_paths.append(
+                clip_path.with_name(f"{clip_path.stem}_frame_{frame_index:06d}.png")
+            )
+            frame_index += 1
+    finally:
+        capture.release()
+
+    if not frames:
+        raise ValueError(f"No frames read from clip: {clip_path}")
+
+    return np.stack(frames, axis=0), frame_paths
 
 
 def discover_segment_dirs(source_root: Path) -> list[tuple[Path, str, str]]:
@@ -592,6 +668,73 @@ def process_segment(
     return "processed"
 
 
+def process_direct_clip(
+    *,
+    source_clip_path: Path,
+    dest_segment_dir: Path,
+    video_filename: str,
+    segment_name: str,
+    model_complexity: int,
+    smooth_landmarks: bool,
+    min_detection_confidence: float,
+    min_tracking_confidence: float,
+    overwrite: bool,
+    verbose: bool,
+) -> str:
+    """
+    Process one pre-cut gesture clip MP4.
+
+    Returns:
+        One of: "processed", "skipped", "failed_no_frames"
+    """
+    if ANNOTATION_ONLY_MODE:
+        print(
+            "Warning: annotation-only mode is not supported for direct clip parsing."
+        )
+        return "failed_no_frames"
+
+    dest_landmarks_path = dest_segment_dir / "landmarks.json"
+
+    if dest_landmarks_path.exists() and not overwrite:
+        if verbose:
+            print(f"Skipping existing landmarks: {dest_landmarks_path}")
+        return "skipped"
+
+    try:
+        frames, frame_paths = load_direct_clip_frames(source_clip_path)
+    except (RuntimeError, ValueError) as exc:
+        print(f"Warning: {exc}")
+        return "failed_no_frames"
+
+    landmarks = extract_pose_landmarks(
+        frames,
+        model_complexity=model_complexity,
+        smooth_landmarks=smooth_landmarks,
+        min_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=min_tracking_confidence,
+    )
+    assert isinstance(landmarks, np.ndarray)
+
+    payload = build_landmarks_payload(
+        video_filename=video_filename,
+        segment_name=segment_name,
+        source_segment_dir=source_clip_path,
+        frame_paths=frame_paths,
+        landmarks=landmarks,
+        num_joints=NUM_POSE_LANDMARKS,
+    )
+
+    dest_segment_dir.mkdir(parents=True, exist_ok=True)
+    with dest_landmarks_path.open("w", encoding="utf-8") as output_file:
+        json.dump(json_safe(payload), output_file, indent=2)
+        output_file.write("\n")
+
+    if verbose:
+        print(f"Saved landmarks: {dest_landmarks_path}")
+
+    return "processed"
+
+
 def run_batch(
     *,
     source_root: Path,
@@ -603,6 +746,7 @@ def run_batch(
     overwrite: bool,
     max_segments: int | None,
     verbose: bool,
+    direct_clip_parse: bool = False,
 ) -> None:
     source_root = source_root.expanduser().resolve()
     dest_root = dest_root.expanduser().resolve()
@@ -612,7 +756,10 @@ def run_batch(
 
     dest_root.mkdir(parents=True, exist_ok=True)
 
-    segment_entries = discover_segment_dirs(source_root)
+    if direct_clip_parse:
+        segment_entries = discover_direct_clips(source_root)
+    else:
+        segment_entries = discover_segment_dirs(source_root)
     if max_segments is not None:
         segment_entries = segment_entries[:max_segments]
 
@@ -623,13 +770,18 @@ def run_batch(
 
     print(f"Source root: {source_root}")
     print(f"Destination root: {dest_root}")
+    if direct_clip_parse:
+        print("Mode: direct gesture clip MP4 parsing")
     if ANNOTATION_ONLY_MODE:
         print("Mode: annotation-only (landmark extraction temporarily disabled)")
     else:
         print(f"MediaPipe model complexity: {model_complexity}")
         print(f"Landmarks per frame: {NUM_POSE_LANDMARKS} body (MediaPipe Pose)")
     print(f"Video directories found: {len(video_dirs)}")
-    print(f"Segment directories found: {len(segment_entries)}")
+    if direct_clip_parse:
+        print(f"Gesture clip files found: {len(segment_entries)}")
+    else:
+        print(f"Segment directories found: {len(segment_entries)}")
     print()
 
     processed_count = 0
@@ -646,33 +798,47 @@ def run_batch(
     if tqdm is not None:
         iterator = tqdm(segment_entries, desc=progress_desc, unit="segment")
 
-    for index, (source_segment_dir, video_filename, segment_name) in enumerate(
+    for index, (source_path, video_filename, segment_name) in enumerate(
         iterator, start=1
     ):
         dest_segment_dir = dest_root / video_filename / segment_name
         if verbose or tqdm is None:
             print(
                 f"Processing segment {index}/{len(segment_entries)}: "
-                f"{source_segment_dir}"
+                f"{source_path}"
             )
 
         try:
-            status = process_segment(
-                source_segment_dir=source_segment_dir,
-                dest_segment_dir=dest_segment_dir,
-                video_filename=video_filename,
-                segment_name=segment_name,
-                model_complexity=model_complexity,
-                smooth_landmarks=smooth_landmarks,
-                min_detection_confidence=min_detection_confidence,
-                min_tracking_confidence=min_tracking_confidence,
-                overwrite=overwrite,
-                verbose=verbose,
-                eaf_cache=eaf_cache,
-            )
+            if direct_clip_parse:
+                status = process_direct_clip(
+                    source_clip_path=source_path,
+                    dest_segment_dir=dest_segment_dir,
+                    video_filename=video_filename,
+                    segment_name=segment_name,
+                    model_complexity=model_complexity,
+                    smooth_landmarks=smooth_landmarks,
+                    min_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=min_tracking_confidence,
+                    overwrite=overwrite,
+                    verbose=verbose,
+                )
+            else:
+                status = process_segment(
+                    source_segment_dir=source_path,
+                    dest_segment_dir=dest_segment_dir,
+                    video_filename=video_filename,
+                    segment_name=segment_name,
+                    model_complexity=model_complexity,
+                    smooth_landmarks=smooth_landmarks,
+                    min_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=min_tracking_confidence,
+                    overwrite=overwrite,
+                    verbose=verbose,
+                    eaf_cache=eaf_cache,
+                )
         except Exception as exc:
             failed_count += 1
-            print(f"Failed segment: {source_segment_dir}")
+            print(f"Failed segment: {source_path}")
             print(f"  Error: {exc}")
             continue
 
@@ -702,9 +868,17 @@ def run_batch(
 def main() -> None:
     args = parse_args()
 
+    source_root = args.source_root.expanduser().resolve()
+    dest_root = args.dest_root.expanduser().resolve()
+    if args.direct_clip_parse:
+        if source_root == Path(DEFAULT_NEG_SOURCE_ROOT).expanduser().resolve():
+            source_root = Path(DEFAULT_SOURCE_ROOT).expanduser().resolve()
+        if dest_root == Path(DEFAULT_NEG_DEST_ROOT).expanduser().resolve():
+            dest_root = Path(DEFAULT_DEST_ROOT).expanduser().resolve()
+
     run_batch(
-        source_root=args.source_root,
-        dest_root=args.dest_root,
+        source_root=source_root,
+        dest_root=dest_root,
         model_complexity=args.model_complexity,
         smooth_landmarks=args.smooth_landmarks,
         min_detection_confidence=args.min_detection_confidence,
@@ -712,6 +886,7 @@ def main() -> None:
         overwrite=args.overwrite,
         max_segments=args.max_segments,
         verbose=args.verbose,
+        direct_clip_parse=args.direct_clip_parse,
     )
 
 

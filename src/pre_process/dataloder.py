@@ -1035,6 +1035,41 @@ def select_mediapipe_face_upper_body_landmarks(landmarks: np.ndarray) -> np.ndar
     return landmarks[:, MEDIAPIPE_FACE_UPPER_BODY_LANDMARK_INDICES, :]
 
 
+def read_segment_landmarks(
+    landmarks_path: Path,
+    *,
+    num_frames: int | None,
+    return_tensor: bool = True,
+) -> torch.Tensor | np.ndarray:
+    """
+    Load, temporally subsample, and select upper-body joints from one segment.
+
+    Matches the landmark preprocessing used by ``AphasiaGestureSegmentDataset``.
+    """
+    sequence = load_landmarks_from_json(landmarks_path)
+    selected_indices = _select_temporal_indices(sequence.num_frames, num_frames)
+    sequence = PoseLandmarkSequence(
+        body=sequence.body[selected_indices],
+        extractor=sequence.extractor,
+        hand_left=(
+            sequence.hand_left[selected_indices]
+            if sequence.hand_left is not None
+            else None
+        ),
+        hand_right=(
+            sequence.hand_right[selected_indices]
+            if sequence.hand_right is not None
+            else None
+        ),
+    )
+    landmarks = select_upper_body_landmarks(sequence)
+
+    if return_tensor:
+        return torch.from_numpy(landmarks).float()
+
+    return landmarks.astype(np.float32, copy=False)
+
+
 def select_upper_body_landmarks(
     landmarks: np.ndarray | PoseLandmarkSequence,
     *,
@@ -2422,31 +2457,11 @@ class AphasiaGestureSegmentDataset(Dataset):
         self,
         landmarks_path: Path,
     ) -> torch.Tensor | np.ndarray:
-        sequence = load_landmarks_from_json(landmarks_path)
-        selected_indices = _select_temporal_indices(
-            sequence.num_frames,
-            self.num_frames,
+        return read_segment_landmarks(
+            landmarks_path,
+            num_frames=self.num_frames,
+            return_tensor=self.return_tensor,
         )
-        sequence = PoseLandmarkSequence(
-            body=sequence.body[selected_indices],
-            extractor=sequence.extractor,
-            hand_left=(
-                sequence.hand_left[selected_indices]
-                if sequence.hand_left is not None
-                else None
-            ),
-            hand_right=(
-                sequence.hand_right[selected_indices]
-                if sequence.hand_right is not None
-                else None
-            ),
-        )
-        landmarks = select_upper_body_landmarks(sequence)
-
-        if self.return_tensor:
-            return torch.from_numpy(landmarks).float()
-
-        return landmarks.astype(np.float32, copy=False)
 
     def _read_segment_frames(
         self,

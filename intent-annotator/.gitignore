@@ -1,0 +1,8 @@
+# Participant videos and annotation exports stay out of Git by default.
+/videos/
+/dist/
+intent-annotations_*.json
+intent-annotations_*.csv
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,44 @@
+python prompt_v1.py \
+--vis-source grid \
+--indir /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/sample_input \
+--outdir /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/sample_output/v1_frames.txt
+
+python prompt_v2.py \
+--llm qwen2 \
+--indir /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/sample_input \
+--outdir /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/sample_output/v2_frames.txt
+
+python prompt_v3.py \
+--llm qwen2 \
+--indir /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/sample_output/v2_frames.txt \
+--outdir /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/sample_output/v3_frames.txt
+
+python prompt_t1.py \
+--llm qwen2 \
+--outdir /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/sample_output/t1_frames.txt
+
+python prompt_mm1.py \
+  --llm qwen2 \
+  --context-file sample_output/t1_frames.txt \
+  --gest-desc-file sample_output/v3_frames.txt \
+  --outdir sample_output/mm1_frames.json
+
+python prompt_mm2.py \
+  --llm qwen2 \
+  --context-file sample_output/t1_frames.txt \
+  --gest-desc-file sample_output/v3_frames.txt \
+  --candidate-gesture-meanings sample_output/mm1_frames.json \
+  --outdir sample_output/mm2_frames.json
+
+python prompt_mm3.py \
+  --llm qwen2 \
+  --context-file sample_output/t1_frames.txt \
+  --gest-desc-file sample_output/v3_frames.txt \
+  --candidate-gesture-meanings sample_output/mm1_frames.json \
+  --candidate-intents sample_output/mm2_frames.json \
+  --outdir sample_output/mm3_frames.json
+
+python prompt_full.py \
+  --llm qwen2 \
+  --indir /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/sample_input/frames \
+  --out-dir sample_output/full.txt
