@@ -199,7 +199,7 @@ function selectClip(target, focus = false) {
   $('clip-panel').hidden = false;
   $('clip-panel').setAttribute('aria-labelledby', 'clip-tab-' + index);
   $('clip-title').textContent = clip.title || clip.filename;
-  $('clip-task').textContent = 'Task: ' + (clip.task || 'Placeholder task — replace with the video task name.');
+  $('clip-task').textContent = 'Task: ' + (clip.task || 'Sandwich task');
   $('transcript').textContent = clip.transcript || 'Placeholder transcript — replace with the written transcript.';
   $('placeholder-tag').hidden = clip.placeholder_context === false;
   for (const key of FIELDS) $(key).value = saved[key];
