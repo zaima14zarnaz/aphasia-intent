@@ -17,10 +17,10 @@ jobs:
         with:
           python-version: '3.12'
       - uses: actions/configure-pages@v5
-      - run: python3 scripts/build_site.py
+      - run: python3 intent-annotator/scripts/build_site.py
       - uses: actions/upload-pages-artifact@v4
         with:
-          path: dist
+          path: intent-annotator/dist
   deploy:
     needs: build
     runs-on: ubuntu-latest
