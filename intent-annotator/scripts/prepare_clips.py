@@ -51,7 +51,7 @@ def prepare(source, manifest_path, selection=None, base_url=None, manifest_only=
                     shutil.copy2(candidates[name], target)
         clips.append({
             'id': name, 'title': prior.get('title', f'Clip {i:02d}'), 'filename': name, 'src': src,
-            'task': prior.get('task', 'Placeholder task — replace with the video task name.'),
+            'task': prior.get('task', 'Sandwich task'),
             'transcript': prior.get('transcript', 'Placeholder transcript — replace with the written transcript.'),
             'placeholder_context': prior.get('placeholder_context', True)
         })
