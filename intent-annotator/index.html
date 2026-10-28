@@ -9,47 +9,101 @@
   <script type="module" src="assets/app.js"></script>
 </head>
 <body>
-  <a class="skip-link" href="#annotation-form">Skip to annotation</a>
-  <header class="site-header">
-    <div class="brand"><span class="brand-icon" aria-hidden="true">ia</span><div><h1>Intent Annotator</h1><p>Gesture &amp; communication research</p></div></div>
-    <div class="header-actions"><label class="annotator-label" for="annotator">Annotator ID<input id="annotator" maxlength="120" placeholder="e.g., SLP-01" autocomplete="off"></label><details class="export-menu"><summary>Annotation files <span aria-hidden="true">↓</span></summary><div class="menu-content"><button id="export-json" type="button">Export JSON / backup</button><button id="export-csv" type="button">Export CSV</button><button class="file-action" id="import-button" type="button">Import JSON backup</button><input id="import-json" type="file" accept="application/json,.json" hidden></div></details></div>
-  </header>
+  <a class="skip-link" href="#auth-email">Skip to sign in</a>
 
-  <main>
-    <section class="progress-card" aria-label="Annotation progress">
-      <div><p class="eyebrow">YOUR PROGRESS</p><div class="progress-heading"><strong id="progress-text">0 of 0 clips complete</strong><span id="progress-percent">0%</span></div><progress id="progress" max="1" value="0">0%</progress></div>
-      <div class="save-indicator"><span class="status-dot" aria-hidden="true"></span><span id="save-status" role="status">Responses save in this browser</span></div>
-    </section>
-
-    <div class="setup-note" id="setup-note"><div><strong id="setup-title">Loading clip list…</strong><p id="setup-message">Your clips and annotations stay on your device when using a local folder.</p></div><button class="button button-secondary" id="choose-folder" type="button">Choose video folder</button><input id="video-folder" type="file" webkitdirectory multiple accept="video/mp4,.mp4" hidden></div>
-    <div id="notice" class="notice" role="status" hidden></div>
-
-    <div class="section-heading"><div><p class="eyebrow">ANNOTATION WORKSPACE</p><h2>Observe. Describe. Interpret.</h2></div><span id="clip-position" class="muted">No clip selected</span></div>
-    <nav class="clip-navigation" aria-label="Video clips"><div id="clip-tabs" role="tablist" aria-label="Choose a video"></div></nav>
-
-    <section id="clip-panel" role="tabpanel" tabindex="0" hidden>
-      <div class="workspace">
-        <section class="observation-column" aria-label="Video and context">
-          <div class="panel video-panel"><div class="panel-heading"><div><p class="eyebrow">WATCH THE CLIP</p><h3 id="clip-title">Video clip</h3></div><span id="clip-state" class="badge">Not started</span></div><div class="video-stage"><video id="video" controls playsinline preload="metadata" aria-label="Selected video clip"></video><div id="video-message" class="video-message" hidden><span aria-hidden="true">▷</span><strong id="video-message-title">Add your video clips</strong><p id="video-message-text">Choose your video folder above to begin.</p></div></div><div class="video-toolbar"><button id="replay" class="text-button" type="button">↺ Replay clip</button><label for="playback-speed">Speed <select id="playback-speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option></select></label></div></div>
-          <div class="panel context-panel"><p class="eyebrow">CLIP CONTEXT</p><h3>Video task</h3><p id="task" class="context-text"></p><div class="transcript-heading"><h3>Written transcript</h3><span class="context-tag" id="placeholder-tag">Placeholder</span></div><blockquote id="transcript"></blockquote></div>
-          <p class="observation-note">Watch as many times as needed. Consider how the gesture changes over time and relates to the spoken message.</p>
-        </section>
-
-        <section class="panel annotation-panel" aria-labelledby="annotation-title"><div class="annotation-header"><p class="eyebrow">YOUR ANNOTATION</p><h3 id="annotation-title">Describe the gesture</h3><p>Complete the four text fields, then mark this clip complete. The role of gesture is optional.</p></div>
-          <form id="annotation-form">
-            <div class="field"><label for="movement"><span class="field-number">01</span>Movement description <span class="required-text">Required</span></label><p id="movement-help" class="field-help">Describe the temporal change across the video. Include changes in the hands, palms, fingers, head position, and overall movement.</p><textarea id="movement" name="movement" required rows="4" aria-describedby="movement-help movement-example" placeholder="Describe what you observe…"></textarea><p id="movement-example" class="example"></p></div>
-            <div class="field"><label for="meaning"><span class="field-number">02</span>Gesture meaning <span class="required-text">Required</span></label><p id="meaning-help" class="field-help">Describe what meaning the participant is trying to convey through the gesture.</p><textarea id="meaning" name="meaning" required rows="3" aria-describedby="meaning-help meaning-example" placeholder="What does the gesture mean?"></textarea><p id="meaning-example" class="example"></p></div>
-            <fieldset class="intent-group"><legend><span class="field-number">03</span>Communicative intent</legend><p class="field-help">What is the participant trying to communicate?</p><div class="field"><label for="intent">Intent <span class="required-text">Required</span></label><textarea id="intent" name="intent" required rows="3" aria-describedby="intent-example" placeholder="Describe the intended message…"></textarea><p id="intent-example" class="example"></p></div><div class="field"><label for="reasoning">Reasoning <span class="required-text">Required</span></label><p id="reasoning-help" class="field-help">Explain your reasoning for the intent.</p><textarea id="reasoning" name="reasoning" required rows="3" aria-describedby="reasoning-help reasoning-example" placeholder="Which cues support your interpretation?"></textarea><p id="reasoning-example" class="example"></p></div>
-              <fieldset class="roles"><legend>Role of gesture <span class="optional-text">Optional</span></legend><p class="field-help">What is the role of the gesture being made in this clip? Select all that apply.</p><div id="role-options"></div><p id="role-example" class="example"></p></fieldset>
-            </fieldset>
-            <div class="form-footer"><p id="completion-help">Example lines are guidance only and are not saved as responses.</p><button id="complete" class="button button-primary" type="submit">Mark clip complete <span aria-hidden="true">✓</span></button></div>
-          </form>
-        </section>
+  <div id="auth-screen" class="auth-screen">
+    <header class="auth-brand">
+      <span class="brand-icon" aria-hidden="true">ia</span>
+      <div>
+        <h1>Intent Annotator</h1>
+        <p>Gesture &amp; communication research</p>
       </div>
-      <div class="bottom-navigation"><button id="previous" class="button button-secondary" type="button">← Previous clip</button><span id="bottom-position" class="muted"></span><button id="next" class="button button-primary" type="button">Next clip →</button></div>
+    </header>
+
+    <section class="auth-card panel" aria-labelledby="auth-title">
+      <p class="eyebrow">ACCOUNT ACCESS</p>
+      <h2 id="auth-title">Create an account to begin</h2>
+      <p class="auth-lede">Sign in with your email so your annotations stay associated with you on this device.</p>
+
+      <div class="auth-tabs" role="tablist" aria-label="Account options">
+        <button type="button" role="tab" id="auth-tab-create" aria-selected="true" aria-controls="auth-panel">Create account</button>
+        <button type="button" role="tab" id="auth-tab-signin" aria-selected="false" aria-controls="auth-panel">Sign in</button>
+      </div>
+
+      <form id="auth-form" class="auth-form" novalidate>
+        <div id="auth-panel" role="tabpanel" aria-labelledby="auth-tab-create">
+          <div class="field">
+            <label for="auth-email">Email <span class="required-text">Required</span></label>
+            <input id="auth-email" name="email" type="email" autocomplete="username" required maxlength="254" placeholder="you@clinic.edu">
+          </div>
+          <div class="field">
+            <label for="auth-password">Password <span class="required-text">Required</span></label>
+            <p id="auth-password-help" class="field-help">At least 8 characters. Accounts are stored only in this browser.</p>
+            <input id="auth-password" name="password" type="password" autocomplete="new-password" required minlength="8" maxlength="128" placeholder="••••••••" aria-describedby="auth-password-help">
+          </div>
+          <div class="field" id="auth-confirm-field">
+            <label for="auth-password-confirm">Confirm password <span class="required-text">Required</span></label>
+            <input id="auth-password-confirm" name="password_confirm" type="password" autocomplete="new-password" minlength="8" maxlength="128" placeholder="••••••••">
+          </div>
+        </div>
+        <p id="auth-error" class="auth-error" role="alert" hidden></p>
+        <button id="auth-submit" class="button button-primary auth-submit" type="submit">Create account</button>
+      </form>
     </section>
-    <noscript><p class="notice">Please enable JavaScript to load clips and record annotations.</p></noscript>
-  </main>
-  <footer class="site-footer"><span>Intent Annotator · SLP annotation workspace</span><span>Saved on this device · Export your responses when finished</span></footer>
+
+    <p class="auth-footnote">No server account is created. Your email and password stay on this device for study labeling and local access.</p>
+  </div>
+
+  <div id="app-shell" hidden>
+    <a class="skip-link" href="#annotation-form">Skip to annotation</a>
+    <header class="site-header">
+      <div class="brand"><span class="brand-icon" aria-hidden="true">ia</span><div><h1>Intent Annotator</h1><p>Gesture &amp; communication research</p></div></div>
+      <div class="header-actions">
+        <div class="account-chip" aria-label="Signed-in account">
+          <span class="account-label">Signed in</span>
+          <strong id="account-email"></strong>
+          <button id="sign-out" class="text-button" type="button">Sign out</button>
+        </div>
+        <details class="export-menu"><summary>Annotation files <span aria-hidden="true">↓</span></summary><div class="menu-content"><button id="export-json" type="button">Export JSON / backup</button><button id="export-csv" type="button">Export CSV</button><button class="file-action" id="import-button" type="button">Import JSON backup</button><input id="import-json" type="file" accept="application/json,.json" hidden></div></details>
+      </div>
+    </header>
+
+    <main>
+      <section class="progress-card" aria-label="Annotation progress">
+        <div><p class="eyebrow">YOUR PROGRESS</p><div class="progress-heading"><strong id="progress-text">0 of 0 clips complete</strong><span id="progress-percent">0%</span></div><progress id="progress" max="1" value="0">0%</progress></div>
+        <div class="save-indicator"><span class="status-dot" aria-hidden="true"></span><span id="save-status" role="status">Responses save in this browser</span></div>
+      </section>
+
+      <div class="setup-note" id="setup-note"><div><strong id="setup-title">Loading clip list…</strong><p id="setup-message">Your clips and annotations stay on your device when using a local folder.</p></div><button class="button button-secondary" id="choose-folder" type="button">Choose video folder</button><input id="video-folder" type="file" webkitdirectory multiple accept="video/mp4,.mp4" hidden></div>
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <div class="section-heading"><div><p class="eyebrow">ANNOTATION WORKSPACE</p><h2>Observe. Describe. Interpret.</h2></div><span id="clip-position" class="muted">No clip selected</span></div>
+      <nav class="clip-navigation" aria-label="Video clips"><div id="clip-tabs" role="tablist" aria-label="Choose a video"></div></nav>
+
+      <section id="clip-panel" role="tabpanel" tabindex="0" hidden>
+        <div class="workspace">
+          <section class="observation-column" aria-label="Video and context">
+            <div class="panel video-panel"><div class="panel-heading"><div><p class="eyebrow">WATCH THE CLIP</p><h3 id="clip-title">Video clip</h3></div><span id="clip-state" class="badge">Not started</span></div><div class="video-stage"><video id="video" controls playsinline preload="metadata" aria-label="Selected video clip"></video><div id="video-message" class="video-message" hidden><span aria-hidden="true">▷</span><strong id="video-message-title">Add your video clips</strong><p id="video-message-text">Choose your video folder above to begin.</p></div></div><div class="video-toolbar"><button id="replay" class="text-button" type="button">↺ Replay clip</button><label for="playback-speed">Speed <select id="playback-speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option></select></label></div></div>
+            <div class="panel context-panel"><p class="eyebrow">CLIP CONTEXT</p><h3>Video task</h3><p id="task" class="context-text"></p><div class="transcript-heading"><h3>Written transcript</h3><span class="context-tag" id="placeholder-tag">Placeholder</span></div><blockquote id="transcript"></blockquote></div>
+            <p class="observation-note">Watch as many times as needed. Consider how the gesture changes over time and relates to the spoken message.</p>
+          </section>
+
+          <section class="panel annotation-panel" aria-labelledby="annotation-title"><div class="annotation-header"><p class="eyebrow">YOUR ANNOTATION</p><h3 id="annotation-title">Describe the gesture</h3><p>Complete the four text fields, then mark this clip complete. The role of gesture is optional.</p></div>
+            <form id="annotation-form">
+              <div class="field"><label for="movement"><span class="field-number">01</span>Movement description <span class="required-text">Required</span></label><p id="movement-help" class="field-help">Describe the temporal change across the video. Include changes in the hands, palms, fingers, head position, and overall movement.</p><textarea id="movement" name="movement" required rows="4" aria-describedby="movement-help movement-example" placeholder="Describe what you observe…"></textarea><p id="movement-example" class="example"></p></div>
+              <div class="field"><label for="meaning"><span class="field-number">02</span>Gesture meaning <span class="required-text">Required</span></label><p id="meaning-help" class="field-help">Describe what meaning the participant is trying to convey through the gesture.</p><textarea id="meaning" name="meaning" required rows="3" aria-describedby="meaning-help meaning-example" placeholder="What does the gesture mean?"></textarea><p id="meaning-example" class="example"></p></div>
+              <fieldset class="intent-group"><legend><span class="field-number">03</span>Communicative intent</legend><p class="field-help">What is the participant trying to communicate?</p><div class="field"><label for="intent">Intent <span class="required-text">Required</span></label><textarea id="intent" name="intent" required rows="3" aria-describedby="intent-example" placeholder="Describe the intended message…"></textarea><p id="intent-example" class="example"></p></div><div class="field"><label for="reasoning">Reasoning <span class="required-text">Required</span></label><p id="reasoning-help" class="field-help">Explain your reasoning for the intent.</p><textarea id="reasoning" name="reasoning" required rows="3" aria-describedby="reasoning-help reasoning-example" placeholder="Which cues support your interpretation?"></textarea><p id="reasoning-example" class="example"></p></div>
+                <fieldset class="roles"><legend>Role of gesture <span class="optional-text">Optional</span></legend><p class="field-help">What is the role of the gesture being made in this clip? Select all that apply.</p><div id="role-options"></div><p id="role-example" class="example"></p></fieldset>
+              </fieldset>
+              <div class="form-footer"><p id="completion-help">Example lines are guidance only and are not saved as responses.</p><button id="complete" class="button button-primary" type="submit">Mark clip complete <span aria-hidden="true">✓</span></button></div>
+            </form>
+          </section>
+        </div>
+        <div class="bottom-navigation"><button id="previous" class="button button-secondary" type="button">← Previous clip</button><span id="bottom-position" class="muted"></span><button id="next" class="button button-primary" type="button">Next clip →</button></div>
+      </section>
+      <noscript><p class="notice">Please enable JavaScript to load clips and record annotations.</p></noscript>
+    </main>
+    <footer class="site-footer"><span>Intent Annotator · SLP annotation workspace</span><span>Saved on this device · Export your responses when finished</span></footer>
+  </div>
 </body>
 </html>
