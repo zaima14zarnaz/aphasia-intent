@@ -1,0 +1,28 @@
+{
+    "Prompt A1": {
+        "prompt": "What is the topic of the conversation according to this transcript?\n\nINPUT:\nTranscript:\n<INPUT_TRANSCRIPT>\n\nOUTPUT:\nReturn only a valid JSON object in this format:\n{\n    \"conversation topic\": \"<OUTPUT_CONVERSATION_TOPIC>\"\n}",
+        "json_fields": [
+            "conversation topic"
+        ]
+    },
+    "Prompt A2": {
+        "prompt": "You are given a set of video frames in chronological order, numbered from f1 to fN. The person in the frames is making a gesture. Your task is to describe the movement of the gesture across the frames. Focus on the movement of the hands, fingers, changes in palm orientation, and head.\n\nINPUT:\nVideo frames, ordered from f1 to fN:\n<INPUT_VIDEO_FRAMES>\n\nOUTPUT:\nReturn only a valid JSON object in this format:\n{\n    \"gesture movement description\": \"<OUTPUT_GESTURE_MOVEMENT_DESCRIPTION>\"\n}",
+        "json_fields": [
+            "gesture movement description"
+        ]
+    },
+    "Prompt B": {
+        "prompt": "You are given the description of a gesture and the topic of the conversation when the gesture was being made. Your task is to infer the meaning of the gesture based on the gesture movement description and the conversation topic. Your inferred meaning should be supported by both inputs.\n\nINPUTS:\nGesture movement description (from Prompt A2):\n<INPUT_GESTURE_MOVEMENT_DESCRIPTION>\n\nConversation topic (from Prompt A1):\n<INPUT_CONVERSATION_TOPIC>\n\nOUTPUT:\nReturn only a valid JSON object in this format:\n{\n    \"gesture meaning\": \"<OUTPUT_GESTURE_MEANING>\"\n}",
+        "json_fields": [
+            "gesture meaning"
+        ]
+    },
+    "Prompt C": {
+        "prompt": "Your task is to infer the communicative intent of the person based on the meaning of the gesture, the topic of conversation, and the transcript. The communicative intent must be supported by evidence in these inputs. The output should also contain the reasoning behind the inferred communicative intent and explain how the gesture contributes to that intent.\n\nINPUTS:\nGesture meaning (from Prompt B):\n<INPUT_GESTURE_MEANING>\n\nConversation topic (from Prompt A1):\n<INPUT_CONVERSATION_TOPIC>\n\nTranscript:\n<INPUT_TRANSCRIPT>\n\nOUTPUT:\nReturn only a valid JSON object in this format:\n{\n    \"communicative intent\": \"<OUTPUT_COMMUNICATIVE_INTENT>\",\n    \"reasoning\": \"<OUTPUT_REASONING>\",\n    \"gesture contribution\": \"<OUTPUT_GESTURE_CONTRIBUTION>\"\n}",
+        "json_fields": [
+            "communicative intent",
+            "reasoning",
+            "gesture contribution"
+        ]
+    }
+}

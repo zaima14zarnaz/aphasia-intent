@@ -1,0 +1,10 @@
+{
+  "Prompt C": {
+    "prompt": "Your task is to infer the communicative intent of the person in the frames \nbased on the given transcript and the gesture they are making in the video \nframes. The videos frames are provided in sequence. Output format json: \n{\"communicative intent\":\"...\", \"evidence\": \"evidence for the inferred intent \nfrom the transcript and the gesture...\", \"reasoning\":\"your reasoning for \ninferring the communicative intent based on the evidence...\"}",
+    "json_fields": [
+      "communicative intent",
+      "evidence",
+      "reasoning"
+    ]
+  }
+}
