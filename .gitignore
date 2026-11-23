@@ -19,6 +19,8 @@ src/model/openpose_single_frame_output/
 src/gesture_desc/samples/
 src/pre_process/sample_eaf.txt
 
+src/intent_generation/runs/
+src/intent_generation/checkpoints/
 # Large data and media files
 *.mp4
 *.avi

@@ -875,7 +875,8 @@ def train(args, *, injected_model=None, injected_processor=None, injected_metric
     print(f'Run directory: {args.output_dir}', flush=True)
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f'Use a new/empty --output-dir: {args.output_dir}')
-    metrics_csv = resolve_from_root(args.metrics_csv)
+    metrics_csv = (resolve_from_root(args.metrics_csv) if args.metrics_csv is not None
+                   else args.output_dir / DEFAULT_METRICS_CSV.name)
     metrics_csv.parent.mkdir(parents=True, exist_ok=True)
     metrics_csv.write_text('', encoding='utf-8')
     print(f'Cleared {metrics_csv}', flush=True)
@@ -1032,7 +1033,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--skip-invalid', action='store_true')
     parser.add_argument('--no-gradient-checkpointing', action='store_true')
     parser.add_argument('--local-files-only', action='store_true')
-    parser.add_argument('--metrics-csv', type=Path, default=DEFAULT_METRICS_CSV)
+    parser.add_argument('--metrics-csv', type=Path, default=None,
+                        help=f'Default: {{output-dir}}/{DEFAULT_METRICS_CSV.name}')
     parser.add_argument('--bertscore-model', default='roberta-large')
     parser.add_argument('--bertscore-num-layers', type=int)
     parser.add_argument('--metrics-device', default='cpu', help='BERTScore device; BLEURT uses a separate CPU worker')

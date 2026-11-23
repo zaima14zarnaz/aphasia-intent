@@ -1,26 +1,21 @@
 """Landmark frame selection + one shared Qwen2.5-VL LoRA model, four prompts.
-
 Architecture preserved: pose/next-frame differences -> MLP -> straight-through
 frame selection; frozen Qwen vision/base language weights; language-attention
 LoRA only; differentiable torch image resizing, normalization and patchification.
 Only A2 receives the selected RGB frames. A1/B/C are text-only calls.
-
 There is no optimizer, training loop, or loss computation in this file.
 Requirements: torch, transformers==4.57.1, peft==0.17.1, accelerate.
-
 Training (all four target objects must come from your annotations):
     selection = selector(landmarks, rgb=rgb, frame_mask=frame_mask)
     prepared = llm.prepare_inputs(selection.selected_rgb, transcripts, targets)
     result = llm(prepared=prepared)
     # result.prompts['Prompt A2'].logits / labels / field_masks
     # result.responses[i]['Prompt C']['communicative intent']
-
 ``targets`` is a mapping with keys 'Prompt A1', 'Prompt A2', 'Prompt B',
 'Prompt C'; each value is a batch-length sequence of response JSON objects.
 A1: {'conversation topic': str}; A2: {'gesture movement description': str};
 B: {'gesture meaning': str}; C: {'communicative intent': str, 'reasoning': str,
 'gesture contribution': str}. These are four response objects (six total fields).
-
 Default conditioning='generated' runs the actual four-stage generation chain,
 then builds four teacher-forced sequences against the supplied targets. The
 returned responses are generated predictions, not the annotation targets.
@@ -28,31 +23,26 @@ This costs four generation calls plus four supervised forwards per batch.
 Pass previously generated response_jsons to avoid repeating generation.
 Optional conditioning='targets' explicitly uses annotation evidence for B/C,
 skips generation, and returns responses=None; targets are still available.
-
 Generation/JSON parsing is nondifferentiable: C loss cannot backpropagate through
 B/A1/A2 text. Each stage's own supervised logits retain LoRA gradients; A2 logits
 also retain the selector-to-RGB gradient. Shift logits/labels/masks for causal CE
 in train.py. Autoregressive generation can fail JSON validation; handle
 JSONGenerationError in the caller rather than silently replacing evidence.
-
 Optional prompts_path loads the existing A1_A2_B_C.json. Built-in defaults make
 this file standalone. Placeholders from the earlier prompt templates are
 recognized; plain instructions also work. Do not pass placeholder strings as
 image data: A2 attaches actual selected tensors as Qwen image inputs.
 """
 from __future__ import annotations
-
 import json
 import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
-
 PROMPT_ORDER = ('Prompt A1', 'Prompt A2', 'Prompt B', 'Prompt C')
 PROMPT_FIELDS = {
     'Prompt A1': ('conversation topic',),
@@ -84,8 +74,6 @@ DEFAULT_PROMPTS = {
 # Compatibility constants refer to the final stage only; use PROMPT_FIELDS for all.
 INTENT_PROMPT = DEFAULT_PROMPTS['Prompt C']
 JSON_FIELDS = PROMPT_FIELDS['Prompt C']
-
-
 @dataclass
 class FrameSelection:
     indices: Tensor
@@ -100,20 +88,16 @@ class FrameSelection:
     source_joint_mask: Tensor
     source_frame_mask: Tensor
     selected_rgb: Tensor | None
-
-
 class TemporalFrameSelector(nn.Module):
     """Original pose/difference MLP and distinct chronological ST selections.
-
     Landmarks are [B,T,J,3], RGB is floating [B,T,3,H,W] in [0,1].
     No pose extraction/root normalization is performed here. At least M frames
     with a valid joint are required. Hard forward / soft surrogate backward is
     a biased gradient approximation, not the derivative of discrete top-k.
     """
-
     def __init__(self, num_joints: int = 33, num_frames: int = 8,
-                 hidden_dim: int = 256, temperature: float = 1.0,
-                 stochastic: bool = True, visibility_threshold: float = 0.0):
+        hidden_dim: int = 256, temperature: float = 1.0,
+        stochastic: bool = True, visibility_threshold: float = 0.0):
         super().__init__()
         if any(type(x) is not int or x <= 0 for x in (num_joints, num_frames, hidden_dim)):
             raise ValueError('Joint/frame/hidden sizes must be positive integers')
@@ -128,11 +112,10 @@ class TemporalFrameSelector(nn.Module):
             nn.Linear(num_joints * 6, hidden_dim), nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 1),
         )
-
     def forward(self, landmarks: Tensor, frame_mask: Tensor | None = None,
-                landmark_mask: Tensor | None = None, visibility: Tensor | None = None,
-                rgb: Tensor | None = None, frame_times: Tensor | None = None,
-                temperature: float | None = None) -> FrameSelection:
+        landmark_mask: Tensor | None = None, visibility: Tensor | None = None,
+        rgb: Tensor | None = None, frame_times: Tensor | None = None,
+        temperature: float | None = None) -> FrameSelection:
         if landmarks.ndim != 4 or landmarks.shape[2:] != (self.num_joints, 3):
             raise ValueError(f'landmarks must be [B,T,{self.num_joints},3] XYZ only')
         b, t, j, _ = landmarks.shape
@@ -140,9 +123,9 @@ class TemporalFrameSelector(nn.Module):
             raise ValueError('Expected a nonempty floating-point landmark tensor')
         device = landmarks.device
         frame_mask = (torch.ones((b, t), dtype=torch.bool, device=device) if frame_mask is None
-                      else frame_mask.to(device=device, dtype=torch.bool))
+else frame_mask.to(device=device, dtype=torch.bool))
         landmark_mask = (torch.ones((b, t, j), dtype=torch.bool, device=device) if landmark_mask is None
-                         else landmark_mask.to(device=device, dtype=torch.bool))
+else landmark_mask.to(device=device, dtype=torch.bool))
         if frame_mask.shape != (b, t) or landmark_mask.shape != (b, t, j):
             raise ValueError('Incorrect frame_mask or landmark_mask shape')
         joint_mask = landmark_mask & frame_mask.unsqueeze(-1)
@@ -214,24 +197,18 @@ class TemporalFrameSelector(nn.Module):
                               F.softmax(scores / tau, -1), selected_pose,
                               selected_mask, selected_times, times, joint_mask,
                               frame_mask, selected_rgb)
-
-
 @dataclass
 class PreparedQwenBatch:
     model_inputs: dict[str, Tensor]
     labels: Tensor | None
     prompt_lengths: Tensor
     field_masks: dict[str, Tensor] | None = None
-
-
 @dataclass
 class PreparedHierarchy:
     prompts: dict[str, PreparedQwenBatch]
     responses: list[dict[str, dict[str, str]]] | None
     targets: dict[str, list[dict[str, str]]] | None
     conditioning: str
-
-
 @dataclass
 class PromptOutput:
     output_fields: tuple[str, ...]
@@ -239,12 +216,9 @@ class PromptOutput:
     labels: Tensor | None
     field_masks: dict[str, Tensor] | None
     responses: list[dict[str, str]] | None
-
     @property
     def logits(self) -> Tensor:
         return self.model_output.logits
-
-
 @dataclass
 class HierarchicalOutput:
     prompts: dict[str, PromptOutput]
@@ -252,34 +226,28 @@ class HierarchicalOutput:
     targets: dict[str, list[dict[str, str]]] | None
     conditioning: str
     selection: FrameSelection | None = None
-
-
 class JSONGenerationError(ValueError):
     def __init__(self, raw_output: str, message: str = 'Model did not generate the required JSON object',
-                 prompt_name: str | None = None, sample_index: int | None = None):
+        prompt_name: str | None = None, sample_index: int | None = None):
         super().__init__(f'{prompt_name or "Generation"}, sample {sample_index}: {message}')
         self.raw_output = raw_output
         self.prompt_name = prompt_name
         self.sample_index = sample_index
-
-
 class QwenIntentModel(nn.Module):
     """One shared Qwen2.5-VL-7B model, language-attention LoRA, four prompts.
-
     prepare_inputs returns all four stage batches, not a single C batch.
     forward(prepared=...) returns all four supervised model outputs without loss.
     forward(**one_stage.model_inputs) remains available for stagewise training.
     generate_json returns every prompt's complete response JSON per sample.
     """
-
     def __init__(self, model_name: str = 'Qwen/Qwen2.5-VL-7B-Instruct',
-                 training_mode: str = 'lora', device: str | torch.device | None = None,
-                 dtype: torch.dtype | None = None, gradient_checkpointing: bool = True,
-                 num_frames: int = 8, lora_rank: int = 16, lora_alpha: int = 32,
-                 lora_dropout: float = 0.05, model: nn.Module | None = None,
-                 processor: Any | None = None, local_files_only: bool = False,
-                 output_fields: Sequence[str] = JSON_FIELDS,
-                 prompts_path: str | Path | None = None):
+        training_mode: str = 'lora', device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None, gradient_checkpointing: bool = True,
+        num_frames: int = 8, lora_rank: int = 16, lora_alpha: int = 32,
+        lora_dropout: float = 0.05, model: nn.Module | None = None,
+        processor: Any | None = None, local_files_only: bool = False,
+        output_fields: Sequence[str] = JSON_FIELDS,
+        prompts_path: str | Path | None = None):
         super().__init__()
         if training_mode != 'lora':
             raise ValueError("QwenIntentModel supports LoRA training only; training_mode must be 'lora'")
@@ -297,7 +265,7 @@ class QwenIntentModel(nn.Module):
         device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         if dtype is None:
             dtype = ((torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
-                     if device.type == 'cuda' else torch.float32)
+            if device.type == 'cuda' else torch.float32)
         if model is None:
             try:
                 from transformers import AutoProcessor, AutoTokenizer, Qwen2_5_VLForConditionalGeneration
@@ -316,14 +284,14 @@ class QwenIntentModel(nn.Module):
         except ImportError as exc:
             raise ImportError('LoRA training requires peft==0.17.1') from exc
         targets = [name for name, module in self.model.named_modules()
-                   if isinstance(module, nn.Linear) and '.self_attn.' in name
+            if isinstance(module, nn.Linear) and '.self_attn.' in name
                    and name.rsplit('.', 1)[-1] in ('q_proj', 'k_proj', 'v_proj', 'o_proj')
                    and '.visual.' not in name]
         if not targets:
             raise ValueError('Cannot find Qwen language attention projections for LoRA')
         config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=lora_rank,
-                            lora_alpha=lora_alpha, lora_dropout=lora_dropout,
-                            target_modules=targets, bias='none')
+            lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+            target_modules=targets, bias='none')
         self.model = get_peft_model(self.model, config)
         for name, parameter in self.model.named_parameters():
             parameter.requires_grad_(('lora_A.' in name or 'lora_B.' in name) and '.visual.' not in name)
@@ -355,7 +323,6 @@ class QwenIntentModel(nn.Module):
         if self.image_token_id != self.model.config.image_token_id:
             raise ValueError('Tokenizer and model image token IDs differ')
         self.train()
-
     @staticmethod
     def _load_prompts(path: str | Path | None) -> dict[str, str]:
         if path is None:
@@ -371,11 +338,9 @@ class QwenIntentModel(nn.Module):
                 raise ValueError(f'{name} json_fields must be {PROMPT_FIELDS[name]}')
             prompts[name] = item['prompt']
         return prompts
-
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
-
     def _image_inputs(self, rgb: Tensor) -> tuple[Tensor, Tensor, int]:
         if rgb.ndim != 5 or rgb.shape[1:3] != (self.num_frames, 3) or rgb.shape[0] == 0:
             raise ValueError(f'RGB must be [B,{self.num_frames},3,H,W]')
@@ -405,7 +370,6 @@ class QwenIntentModel(nn.Module):
         patches = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9).reshape(b * m * gh * gw, 3 * tp * p * p)
         grid = torch.tensor([[1, gh, gw]], dtype=torch.long, device=self.device).expand(b * m, -1).contiguous()
         return patches, grid, gh * gw // (s * s)
-
     @staticmethod
     def _validate_json(obj: Any, fields: Sequence[str] = JSON_FIELDS) -> None:
         if (not isinstance(obj, dict) or set(obj) != set(fields)
@@ -413,9 +377,8 @@ class QwenIntentModel(nn.Module):
             raise ValueError(f'Expected exactly these JSON string fields: {tuple(fields)}')
         if any('<|' in obj[k] for k in fields):
             raise ValueError('Response contains a reserved Qwen control token')
-
     def _batch_objects(self, name: str, values: Sequence[Mapping[str, str] | str],
-                       batch_size: int) -> list[dict[str, str]]:
+        batch_size: int) -> list[dict[str, str]]:
         if isinstance(values, (str, bytes, Mapping)) or len(values) != batch_size:
             raise ValueError(f'{name} requires one response object per clip')
         result = []
@@ -424,9 +387,8 @@ class QwenIntentModel(nn.Module):
             self._validate_json(obj, PROMPT_FIELDS[name])
             result.append(obj)
         return result
-
     def _messages(self, name: str, inputs: Mapping[str, str],
-                  target: str | None = None) -> list[dict]:
+        target: str | None = None) -> list[dict]:
         replacements = {f'<INPUT_{key}>': value for key, value in inputs.items()}
         replacements['<INPUT_VIDEO_FRAMES>'] = '(Ordered frames attached below.)'
         instruction = self.prompts[name]
@@ -456,20 +418,18 @@ class QwenIntentModel(nn.Module):
         if target is not None:
             messages.append({'role': 'assistant', 'content': target})
         return messages
-
     def _render(self, name: str, messages: list[dict], image_tokens: int,
-                generation_prompt: bool) -> str:
+        generation_prompt: bool) -> str:
         text = self.processor.apply_chat_template(messages, tokenize=False,
-                                                  add_generation_prompt=generation_prompt)
+            add_generation_prompt=generation_prompt)
         parts = text.split(self.image_token)
         expected = self.num_frames if name == 'Prompt A2' else 0
         if len(parts) != expected + 1:
             raise ValueError(f'{name}: unexpected number of image placeholders')
         return (self.image_token * image_tokens).join(parts)
-
     def _prepare_stage(self, name: str, inputs: Sequence[Mapping[str, str]],
-                       rgb: Tensor | None = None,
-                       targets: Sequence[Mapping[str, str] | str] | None = None) -> PreparedQwenBatch:
+        rgb: Tensor | None = None,
+        targets: Sequence[Mapping[str, str] | str] | None = None) -> PreparedQwenBatch:
         if name not in PROMPT_FIELDS or not inputs:
             raise ValueError('Supply a valid prompt name and a nonempty input batch')
         b = len(inputs)
@@ -500,13 +460,13 @@ class QwenIntentModel(nn.Module):
                 full_texts.append(full_text)
                 boundaries.append(len(full_text) - len(prompts[-1]))
                 field_ranges.append([(len(prompts[-1]) + boundaries[k], len(prompts[-1]) + boundaries[k + 1])
-                                     for k in range(len(fields))])
+                for k in range(len(fields))])
         tokenizer = self.processor.tokenizer
         if objects is not None and not tokenizer.is_fast:
             raise ValueError('Field-specific training requires a fast tokenizer for character offsets')
         tokens = tokenizer(full_texts if objects is not None else prompts, padding=True,
-                           truncation=False, add_special_tokens=False, return_tensors='pt',
-                           return_offsets_mapping=objects is not None)
+            truncation=False, add_special_tokens=False, return_tensors='pt',
+            return_offsets_mapping=objects is not None)
         ids, attention = tokens['input_ids'], tokens['attention_mask']
         lengths, labels = [], None
         if objects is not None:
@@ -539,10 +499,9 @@ class QwenIntentModel(nn.Module):
             model_inputs.update(pixel_values=pixels, image_grid_thw=grid)
         return PreparedQwenBatch(model_inputs, None if labels is None else labels.to(self.device),
                                  torch.tensor(lengths, device=self.device), field_masks)
-
     @staticmethod
     def _inputs_for(name: str, transcripts: Sequence[str],
-                    responses: Sequence[Mapping[str, Mapping[str, str]]]) -> list[dict[str, str]]:
+        responses: Sequence[Mapping[str, Mapping[str, str]]]) -> list[dict[str, str]]:
         if name == 'Prompt A1':
             return [{'TRANSCRIPT': text} for text in transcripts]
         if name == 'Prompt A2':
@@ -555,7 +514,6 @@ class QwenIntentModel(nn.Module):
                      'CONVERSATION_TOPIC': item['Prompt A1']['conversation topic'],
                      'TRANSCRIPT': text} for item, text in zip(responses, transcripts)]
         raise ValueError(f'Unknown prompt {name}')
-
     def _validate_batch(self, rgb: Tensor, transcripts: Sequence[str]) -> int:
         if rgb.ndim != 5 or rgb.shape[0] == 0 or rgb.shape[1:3] != (self.num_frames, 3):
             raise ValueError(f'Expected selected RGB [B,{self.num_frames},3,H,W]')
@@ -565,15 +523,13 @@ class QwenIntentModel(nn.Module):
         if any(not isinstance(text, str) or '<|' in text for text in transcripts):
             raise ValueError('Transcripts must be strings without reserved Qwen control tokens')
         return b
-
     def prepare_inputs(self, rgb: Tensor, transcripts: Sequence[str],
-                       target_jsons: Mapping[str, Sequence[Mapping[str, str] | str]] | None = None,
+        target_jsons: Mapping[str, Sequence[Mapping[str, str] | str]] | None = None,
                        *, conditioning: str = 'generated',
-                       response_jsons: Sequence[Mapping[str, Mapping[str, str]]] | None = None,
-                       max_new_tokens: int | Mapping[str, int] = 512,
-                       generation_kwargs: Mapping[str, Any] | None = None) -> PreparedHierarchy:
+        response_jsons: Sequence[Mapping[str, Mapping[str, str]]] | None = None,
+        max_new_tokens: int | Mapping[str, int] = 512,
+        generation_kwargs: Mapping[str, Any] | None = None) -> PreparedHierarchy:
         """Prepare all four prompts, assistant labels, and per-field token masks.
-
         Generated evidence is the default, including during training. Explicit
         target conditioning is available for teacher-forced upstream evidence.
         Responses and supervision targets are separate to avoid target leakage.
@@ -617,10 +573,8 @@ class QwenIntentModel(nn.Module):
                 rgb if name == 'Prompt A2' else None,
                 None if targets is None else targets[name])
         return PreparedHierarchy(prepared, responses, targets, conditioning)
-
     def forward(self, prepared: PreparedHierarchy | None = None, **model_inputs):
         """Return four prompt outputs, or raw Qwen outputs for a single stage.
-
         For each PromptOutput, logits are [B,L,V]; labels are [B,L] with prompt
         and padding -100; masks are [B,L] by JSON field. For causal CE compare
         logits[:, :-1] against labels[:, 1:] and field_masks[field][:, 1:].
@@ -641,10 +595,9 @@ class QwenIntentModel(nn.Module):
             outputs[name] = PromptOutput(PROMPT_FIELDS[name], model_output, batch.labels,
                                           batch.field_masks, responses)
         return HierarchicalOutput(outputs, prepared.responses, prepared.targets, prepared.conditioning)
-
     def _generate_stage(self, name: str, inputs: Sequence[Mapping[str, str]],
-                        rgb: Tensor | None, max_new_tokens: int,
-                        generation_kwargs: Mapping[str, Any]) -> list[dict[str, str]]:
+        rgb: Tensor | None, max_new_tokens: int,
+        generation_kwargs: Mapping[str, Any]) -> list[dict[str, str]]:
         if type(max_new_tokens) is not int or max_new_tokens <= 0:
             raise ValueError('max_new_tokens must be a positive integer')
         batch = self._prepare_stage(name, inputs, rgb)
@@ -656,7 +609,7 @@ class QwenIntentModel(nn.Module):
         generated = self.model.generate(**batch.model_inputs, **opts)
         continuation = generated[:, batch.model_inputs['input_ids'].shape[1]:]
         texts = self.processor.tokenizer.batch_decode(continuation, skip_special_tokens=True,
-                                                       clean_up_tokenization_spaces=False)
+            clean_up_tokenization_spaces=False)
         if len(texts) != len(inputs):
             raise ValueError('Generation batch size changed unexpectedly')
         objects = []
@@ -671,13 +624,11 @@ class QwenIntentModel(nn.Module):
                 raise JSONGenerationError(text, prompt_name=name, sample_index=i) from exc
             objects.append(obj)
         return objects
-
     @torch.no_grad()
     def generate_json(self, rgb: Tensor, transcripts: Sequence[str],
-                      max_new_tokens: int | Mapping[str, int] = 512,
+        max_new_tokens: int | Mapping[str, int] = 512,
                       **generation_kwargs) -> list[dict[str, dict[str, str]]]:
         """Generate A1, A2, B, C in order and return all complete response JSONs.
-
         A1 <- transcript; A2 <- selected frames; B <- A2 description + A1 topic;
         C <- B meaning + A1 topic + transcript. A1/A2 do not see each other's
         response. No annotation is used. JSON errors include stage/sample/raw text.
@@ -698,53 +649,45 @@ class QwenIntentModel(nn.Module):
             return responses
         finally:
             self.train(was_training)
-
     def generate_text(self, rgb: Tensor, transcripts: Sequence[str], **kwargs) -> list[dict[str, str]]:
         """Return each stage's validated response serialized as JSON text.
-
         Unlike the original single-C API this returns four strings per sample.
         Use generate_json for structured fields; neither method calculates loss.
         """
         return [{name: json.dumps(obj[name], ensure_ascii=False) for name in PROMPT_ORDER}
-                for obj in self.generate_json(rgb, transcripts, **kwargs)]
-
-
+        for obj in self.generate_json(rgb, transcripts, **kwargs)]
 class AphasiaIntentPipeline(nn.Module):
     """Convenience composition of the same selector and shared Qwen wrapper.
-
     Accepts full-clip RGB; Qwen receives only the selector's selected_rgb, at A2.
     Existing callers may continue using the two components separately instead.
     """
-
     def __init__(self, selector: TemporalFrameSelector, llm: QwenIntentModel):
         super().__init__()
         if selector.num_frames != llm.num_frames:
             raise ValueError('Selector and Qwen must use the same num_frames')
         self.selector, self.llm = selector, llm
-
     def forward(self, landmarks: Tensor, rgb: Tensor, transcripts: Sequence[str],
-                target_jsons: Mapping[str, Sequence[Mapping[str, str] | str]] | None = None,
+        target_jsons: Mapping[str, Sequence[Mapping[str, str] | str]] | None = None,
                 *, frame_mask: Tensor | None = None, landmark_mask: Tensor | None = None,
-                visibility: Tensor | None = None, frame_times: Tensor | None = None,
-                temperature: float | None = None, **prepare_kwargs) -> HierarchicalOutput:
+        visibility: Tensor | None = None, frame_times: Tensor | None = None,
+        temperature: float | None = None, **prepare_kwargs) -> HierarchicalOutput:
         selection = self.selector(landmarks, frame_mask=frame_mask, landmark_mask=landmark_mask,
-                                  visibility=visibility, rgb=rgb, frame_times=frame_times,
-                                  temperature=temperature)
+            visibility=visibility, rgb=rgb, frame_times=frame_times,
+            temperature=temperature)
         prepared = self.llm.prepare_inputs(selection.selected_rgb, transcripts, target_jsons, **prepare_kwargs)
         result = self.llm(prepared=prepared)
         result.selection = selection
         return result
-
     @torch.no_grad()
     def generate_json(self, landmarks: Tensor, rgb: Tensor, transcripts: Sequence[str],
                       *, frame_mask: Tensor | None = None, landmark_mask: Tensor | None = None,
-                      visibility: Tensor | None = None, frame_times: Tensor | None = None,
+        visibility: Tensor | None = None, frame_times: Tensor | None = None,
                       **generation_kwargs) -> list[dict[str, dict[str, str]]]:
         was_training = self.training
         self.eval()
         try:
             selection = self.selector(landmarks, frame_mask=frame_mask, landmark_mask=landmark_mask,
-                                      visibility=visibility, rgb=rgb, frame_times=frame_times)
+            visibility=visibility, rgb=rgb, frame_times=frame_times)
             return self.llm.generate_json(selection.selected_rgb, transcripts, **generation_kwargs)
         finally:
             self.train(was_training)
