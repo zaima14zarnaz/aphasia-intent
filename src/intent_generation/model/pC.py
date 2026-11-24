@@ -1,5 +1,10 @@
 """Landmark-driven frame selection and a trainable Qwen2.5-VL wrapper.
 
+Default landmarks: OpenPose BODY_25 + left hand (21) + right hand (21) = 67
+joints in that order (same concatenation as pre_process.load_aligned_media).
+Coordinates are XYZ; OpenPose depth is typically zero with confidence in
+visibility. Pass num_joints=33 only for legacy MediaPipe Pose caches.
+
 See TRAINING_USAGE.md. No optimizer, training loop, or loss calculation lives here.
 Training uses forward logits; generate_json() returns complete JSON objects.
 Validated against transformers==4.57.1 and peft==0.17.1.
@@ -58,12 +63,17 @@ class TemporalFrameSelector(nn.Module):
     Neither extraction nor root/body-scale normalization is performed here.
     """
 
-    def __init__(self, num_joints: int = 33, num_frames: int = 8,
+    def __init__(self, num_joints: int = 67, num_frames: int = 8,
                  hidden_dim: int = 256, temperature: float = 1.0,
                  stochastic: bool = True, visibility_threshold: float = 0.0):
         super().__init__()
         if any(type(x) is not int or x <= 0 for x in (num_joints, num_frames, hidden_dim)):
             raise ValueError("Joint/frame/hidden sizes must be positive integers")
+        if num_joints not in (67, 33, 60):
+            raise ValueError(
+                "num_joints must be 67 (OpenPose BODY_25+hands), 60 (COCO_18+hands), "
+                "or 33 (legacy MediaPipe Pose)"
+            )
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be finite and positive")
         if not 0 <= visibility_threshold < 1:

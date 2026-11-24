@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TYPE_CHECKING
 
+from tqdm.auto import tqdm
+
 # Keep the worker importable in a TensorFlow-only environment without torch.
 EXPECTED_FIELDS = ("communicative intent", "reasoning")
 if TYPE_CHECKING:
@@ -36,6 +38,8 @@ class MetricsConfig:
     bleurt_checkpoint: str = "checkpoints/BLEURT-20"
     bleurt_python: str = sys.executable
     bleurt_timeout: float = 1800.0
+    # Temporary kill-switch used by train.py / train_motion.py.
+    enable_bleurt: bool = True
 
 
 @dataclass
@@ -156,8 +160,12 @@ class GenerationMetrics:
         self.bleu_class = BLEU
         self.sentence_bleu = BLEU(tokenize="13a", smooth_method="exp", effective_order=True)
         self.reference_metrics: dict[str, dict[str, float]] = {}
-        # Probe BLEURT before loading BERTScore, so setup errors surface early.
-        self.bleurt = bleurt_scorer if bleurt_scorer is not None else OfficialBleurtBackend(self.config)
+        if self.config.enable_bleurt:
+            # Probe BLEURT before loading BERTScore, so setup errors surface early.
+            self.bleurt = bleurt_scorer if bleurt_scorer is not None else OfficialBleurtBackend(self.config)
+        else:
+            self.bleurt = None
+            print("BLEURT scoring temporarily disabled (enable_bleurt=False).", flush=True)
         if bert_scorer is None:
             try:
                 from bert_score import BERTScorer
@@ -172,12 +180,13 @@ class GenerationMetrics:
                          "bertscore_num_layers": getattr(self.bert, "num_layers", self.config.bertscore_num_layers),
                          "bertscore_hash": getattr(self.bert, "hash", "injected"),
                          "bleurt_checkpoint": str(self.config.bleurt_checkpoint),
+                         "bleurt_enabled": self.config.enable_bleurt,
                          "bleu_settings": "tokenizer=13a;smooth=exp;effective_order=true;scale=0-100",
                          "reference_aggregation": "pairwise_best_and_mean;bleu_native_multireference"}
 
-    def _pair_scores(self, candidates: list[str], references: list[str]) -> dict[str, list[float]]:
+    def _pair_scores(self, candidates: list[str], references: list[str]) -> dict[str, list[float | None]]:
         count = len(candidates)
-        values = {metric: [0.0] * count for metric in PAIR_METRICS}
+        values: dict[str, list[float | None]] = {metric: [0.0] * count for metric in PAIR_METRICS}
         active = [i for i, text in enumerate(candidates) if text.strip()]
         if active:
             _, _, f1 = self.bert.score([candidates[i] for i in active], [references[i] for i in active],
@@ -185,14 +194,25 @@ class GenerationMetrics:
             scores = _validated_scores(f1.detach().cpu().tolist(), len(active), "BERTScore")
             for index, score in zip(active, scores):
                 values["bertscore_f1"][index] = score
-        for i, (candidate, reference) in enumerate(zip(candidates, references)):
+        pair_iter = tqdm(
+            enumerate(zip(candidates, references)),
+            total=count,
+            desc="Val metrics (ROUGE/METEOR)",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for i, (candidate, reference) in pair_iter:
             rouge = self.rouge.score(reference, candidate)
             for name in ("rouge1", "rouge2", "rougeL"):
                 values[name + "_f1"][i] = float(rouge[name].fmeasure)
             values["meteor"][i] = float(self.meteor(self.tokenizer.tokenize(reference), self.tokenizer.tokenize(candidate)))
-        # One worker call scores both fields, minimizing checkpoint reloads.
-        values["bleurt"] = _validated_scores(self.bleurt.score(candidates=candidates, references=references,
-                                                               batch_size=self.config.batch_size), count, "BLEURT")
+        if self.bleurt is None:
+            values["bleurt"] = [None] * count
+        else:
+            # One worker call scores both fields, minimizing checkpoint reloads.
+            values["bleurt"] = _validated_scores(
+                self.bleurt.score(candidates=candidates, references=references,
+                                  batch_size=self.config.batch_size), count, "BLEURT")
         return values
 
     def compute(self, accumulator: ValidationAccumulator) -> dict[str, float | int]:
@@ -229,7 +249,7 @@ class GenerationMetrics:
                     scored[f"{prefix}_bleu"] = float(self.sentence_bleu.sentence_score(hypothesis, [reference_text]).score)
                     scored[f"{prefix}_exact_match"] = float(hypothesis == reference_text)
         self.reference_metrics = per_reference
-        result: dict[str, float | int] = {
+        result: dict[str, float | int | None] = {
             "generation_unique_inputs": len(samples),
             "generation_unique_clips": len({sample.media_id for sample in samples}),
             "generation_annotation_references": sum(len(sample.references) for sample in samples),
@@ -240,6 +260,10 @@ class GenerationMetrics:
         for field, prefix in zip(EXPECTED_FIELDS, ("intent", "reasoning")):
             result[prefix + "_missing_field_rate"] = statistics.mean(field in s.prediction.missing_fields for s in samples)
             for metric in PAIR_METRICS:
+                if metric == "bleurt" and self.bleurt is None:
+                    result[f"{prefix}_{metric}_best"] = None
+                    result[f"{prefix}_{metric}_mean"] = None
+                    continue
                 best, mean = [], []
                 for i in range(len(samples)):
                     start, stop = ranges[(field, i)]
@@ -262,27 +286,37 @@ def print_validation_metrics(values: Mapping[str, Any], epoch: int) -> None:
     """Display every requested metric; BLEU uses 0-100, rates display percentages."""
     print(f"\nValidation generation metrics — epoch {epoch} ({values['generation_unique_inputs']} unique inputs)", flush=True)
     print(f"{'Metric':<23} {'Intent best':>12} {'Intent mean':>12} {'Reason best':>12} {'Reason mean':>12}", flush=True)
+
+    def _fmt(score) -> str:
+        return f"{score:>13.4f}" if score is not None else f"{'n/a':>13}"
+
     for metric in PAIR_METRICS:
         scores = [values[f"{field}_{metric}_{aggregation}"] for field in ("intent", "reasoning") for aggregation in ("best", "mean")]
-        print(f"{metric:<23}" + "".join(f"{score:>13.4f}" for score in scores), flush=True)
+        print(f"{metric:<23}" + "".join(_fmt(score) for score in scores), flush=True)
     print(f"BLEU (corpus, 0-100)     intent={values['intent_bleu']:.4f}  reasoning={values['reasoning_bleu']:.4f}", flush=True)
     for name in ("required_field_completion_rate", "missing_field_rate", "intent_missing_field_rate", "reasoning_missing_field_rate"):
         print(f"{name}: {100 * values[name]:.2f}%", flush=True)
 
 
 def append_epoch_metrics(path: str | Path, *, epoch: int, run_id: str,
-                         train_metrics: Mapping[str, Any], train_eval_metrics: Mapping[str, Any],
-                         val_metrics: Mapping[str, Any], metadata: Mapping[str, Any] | None = None) -> None:
+                         train_metrics: Mapping[str, Any],
+                         val_metrics: Mapping[str, Any],
+                         train_eval_metrics: Mapping[str, Any] | None = None,
+                         metadata: Mapping[str, Any] | None = None) -> None:
     """Append one row per epoch; reject schema changes instead of corrupting CSV.
 
     run_id distinguishes experiments sharing the user's runs/metrics.csv path.
     POSIX file locking serializes concurrent appenders on the training server.
+    train_eval is optional and omitted when not provided (train_eval pass skipped).
     """
     import fcntl
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {"epoch": epoch, "run_id": run_id, "timestamp_utc": datetime.now(timezone.utc).isoformat()}
-    for phase, metrics in (("train", train_metrics), ("train_eval", train_eval_metrics), ("val", val_metrics)):
+    phases = (("train", train_metrics), ("val", val_metrics))
+    if train_eval_metrics:
+        phases = (("train", train_metrics), ("train_eval", train_eval_metrics), ("val", val_metrics))
+    for phase, metrics in phases:
         row.update({f"{phase}_{key}": value for key, value in sorted(metrics.items())})
     row.update({key: value for key, value in sorted((metadata or {}).items())})
     fieldnames = list(row)

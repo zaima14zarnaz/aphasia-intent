@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare long-format annotation CSVs and aligned PNG/MediaPipe sequences.
+"""Prepare long-format annotation CSVs and aligned PNG/openpose sequences.
 
 One CSV row is one annotation reference. By default all four targets are kept
 together; target_fields restricts which annotation outputs are required and stored.
@@ -20,7 +20,7 @@ import numpy as np
 
 DATASET_DIR = "/data/quantization/zaima/aphasiabank/neural2/control/annotations/intent/annotations"
 RGB_DIR = "/data/quantization/zaima/aphasiabank/neural2/control/gest_segments"
-LANDMARKS_DIR = "/data/quantization/zaima/aphasiabank/neural2/control/gest_segments_landmarks/mediapipe"
+LANDMARKS_DIR = "/data/quantization/zaima/aphasiabank/neural2/control/gest_segments_landmarks/openpose"
 TARGET_FIELDS = ("movement_description", "gesture_meaning", "communicative_intent", "reasoning")
 ALIASES = {
     "clip_id": ("clip_id", "clip", "clip_filename"),
@@ -84,10 +84,121 @@ def parse_clip_id(value: str) -> tuple[str, str, str, str]:
     return video, index, category, f"{video}_{index}_{category}.mp4"
 
 
+OPENPOSE_BODY_JOINTS = 25
+OPENPOSE_HAND_JOINTS = 21
+OPENPOSE_BODY_HAND_JOINTS = OPENPOSE_BODY_JOINTS + 2 * OPENPOSE_HAND_JOINTS  # 67
+
+
+def _is_openpose_body25_hand21(data: dict, body_joints: int) -> bool:
+    """True for BODY_25 + left/right HAND_21 exports; false for MediaPipe/body-only."""
+    extractor = data.get("extractor")
+    if isinstance(extractor, str) and extractor == "openpose_body25_hand21":
+        return True
+    hand_shape = data.get("hand_landmark_shape")
+    if hand_shape is not None:
+        if (not isinstance(hand_shape, list) or len(hand_shape) != 3
+                or any(type(v) is not int or v <= 0 for v in hand_shape)):
+            raise ValueError(f"Invalid hand_landmark_shape: {hand_shape!r}")
+        if body_joints != OPENPOSE_BODY_JOINTS or hand_shape[1] != OPENPOSE_HAND_JOINTS:
+            raise ValueError(
+                f"Expected BODY_25 + HAND_21 hand_landmark_shape, got body={body_joints}, "
+                f"hand_landmark_shape={hand_shape}"
+            )
+        return True
+    return False
+
+
+def _visibility_column(fmt: list[str]) -> int | None:
+    """OpenPose stores confidence; MediaPipe/legacy stores visibility."""
+    if "visibility" in fmt:
+        return fmt.index("visibility")
+    if "confidence" in fmt:
+        return fmt.index("confidence")
+    return None
+
+
+def _is_missing_joint(point, channel_count: int) -> bool:
+    """Missing detections: whole-joint None, any None component, or nonfinite values."""
+    if point is None:
+        return True
+    if not isinstance(point, (list, tuple)):
+        return False
+    if len(point) != channel_count:
+        return False
+    if any(value is None for value in point):
+        return True
+    try:
+        array = np.asarray(point, dtype=np.float32)
+    except (TypeError, ValueError):
+        return False
+    return array.shape == (channel_count,) and not np.isfinite(array).all()
+
+
+def _store_joint(xyz: np.ndarray, visibility: np.ndarray, valid: np.ndarray, t: int, j: int,
+                 point, *, fmt: list[str], xyz_columns: list[int], vis_column: int | None,
+                 landmark_path: Path, frame_label: int, joint_label: str) -> None:
+    """Write one joint or leave it masked. Raises on structural malformations."""
+    channel_count = len(fmt)
+    if _is_missing_joint(point, channel_count):
+        return
+    if not isinstance(point, (list, tuple)):
+        raise ValueError(
+            f"Invalid landmark at {landmark_path}, frame {frame_label}, joint {joint_label}: "
+            f"expected a list of {channel_count} values, got {type(point).__name__}"
+        )
+    if len(point) != channel_count:
+        raise ValueError(
+            f"Wrong landmark length at {landmark_path}, frame {frame_label}, joint {joint_label}: "
+            f"expected {channel_count}, got {len(point)}"
+        )
+    try:
+        array = np.asarray(point, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Nonnumeric landmark at {landmark_path}, frame {frame_label}, joint {joint_label}"
+        ) from exc
+    if array.shape != (channel_count,) or not np.isfinite(array).all():
+        raise ValueError(
+            f"Invalid landmark at {landmark_path}, frame {frame_label}, joint {joint_label}"
+        )
+    # OpenPose occasionally emits confidence slightly outside [0, 1]; clip rather
+    # than reject an otherwise valid detection. Nonfinite scores already fail above.
+    confidence = float(array[vis_column]) if vis_column is not None else 1.0
+    if not np.isfinite(confidence):
+        raise ValueError(
+            f"Nonfinite visibility/confidence at {landmark_path}, frame {frame_label}, "
+            f"joint {joint_label}"
+        )
+    confidence = float(np.clip(confidence, 0.0, 1.0))
+    xyz[t, j] = array[xyz_columns]
+    visibility[t, j] = confidence
+    valid[t, j] = True
+
+
+def _hand_joint_list(frame: dict, key: str, *, landmark_path: Path, frame_label: int) -> list:
+    """Return 21 hand joints, or 21 Nones when the entire hand field is missing/empty."""
+    value = frame.get(key)
+    if value is None or value == []:
+        return [None] * OPENPOSE_HAND_JOINTS
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{key} must be a list at {landmark_path}, frame {frame_label}; "
+            f"got {type(value).__name__}"
+        )
+    if len(value) != OPENPOSE_HAND_JOINTS:
+        raise ValueError(
+            f"Wrong {key} joint count at {landmark_path}, frame {frame_label}: "
+            f"expected {OPENPOSE_HAND_JOINTS}, got {len(value)}"
+        )
+    return value
+
+
 def load_aligned_media(rgb_segment: Path, landmark_path: Path) -> tuple[list[str], list[int], np.ndarray, np.ndarray, np.ndarray]:
     """Return matching PNGs, source indices, XYZ, visibility, coordinate validity.
 
-    Null frames/joints have zero coordinates, zero visibility, and a False mask.
+    Null/missing joints keep zero coordinates, zero visibility, and valid=False.
+    OpenPose BODY_25 + hands are concatenated as body, left hand, right hand (67).
+    MediaPipe/body-only files keep their native joint count from landmark_shape.
     Missing PNG files or malformed landmarks are errors, never positional joins.
     """
     with landmark_path.open(encoding="utf-8") as handle:
@@ -111,23 +222,32 @@ def load_aligned_media(rgb_segment: Path, landmark_path: Path) -> tuple[list[str
                               shape[0] != len(frames)):
         raise ValueError(f"Invalid landmark_shape in {landmark_path}")
     first = next((f["landmarks"] for f in frames if f.get("landmarks") is not None), None)
-    joints = shape[1] if shape else (len(first) if isinstance(first, list) else 0)
-    if joints <= 0:
+    body_joints = shape[1] if shape else (len(first) if isinstance(first, list) else 0)
+    if body_joints <= 0:
         raise ValueError(f"Cannot determine joint count: {landmark_path}")
     fmt = data.get("landmark_format", ["x", "y", "z", "visibility"])
-    if not isinstance(fmt, list) or any(not isinstance(c, str) for c in fmt) or len(set(fmt)) != len(fmt) or not {"x", "y", "z"}.issubset(fmt):
+    if (not isinstance(fmt, list) or any(not isinstance(c, str) for c in fmt)
+            or len(set(fmt)) != len(fmt) or not {"x", "y", "z"}.issubset(fmt)):
         raise ValueError(f"landmark_format must contain x, y, z: {landmark_path}")
     if shape and shape[2] != len(fmt):
         raise ValueError(f"landmark_shape and landmark_format disagree: {landmark_path}")
+    openpose_hands = _is_openpose_body25_hand21(data, body_joints)
+    if openpose_hands and body_joints != OPENPOSE_BODY_JOINTS:
+        raise ValueError(
+            f"OpenPose body+hands expects landmark_shape body count {OPENPOSE_BODY_JOINTS}, "
+            f"got {body_joints} in {landmark_path}"
+        )
+    joints = OPENPOSE_BODY_HAND_JOINTS if openpose_hands else body_joints
     xyz_columns = [fmt.index(c) for c in ("x", "y", "z")]
-    vis_column = fmt.index("visibility") if "visibility" in fmt else None
+    vis_column = _visibility_column(fmt)
     xyz = np.zeros((len(frames), joints, 3), dtype=np.float32)
     visibility = np.zeros((len(frames), joints), dtype=np.float32)
     valid = np.zeros((len(frames), joints), dtype=np.bool_)
     paths, frame_indices, seen = [], [], set()
     for t, frame in enumerate(frames):
         filename = frame.get("frame_file")
-        if not isinstance(filename, str) or Path(filename).name != filename or "\\" in filename or Path(filename).suffix.lower() != ".png":
+        if (not isinstance(filename, str) or Path(filename).name != filename
+                or "\\" in filename or Path(filename).suffix.lower() != ".png"):
             raise ValueError(f"Expected a PNG basename in frame_file: {filename!r}")
         if filename in seen:
             raise ValueError(f"Duplicate frame_file: {filename}")
@@ -137,23 +257,34 @@ def load_aligned_media(rgb_segment: Path, landmark_path: Path) -> tuple[list[str
             raise FileNotFoundError(path)
         paths.append(str(path.resolve()))
         frame_indices.append(frame["frame_index"])
-        landmarks = frame.get("landmarks")
-        if landmarks is None:
-            continue
-        if not isinstance(landmarks, list) or len(landmarks) != joints:
-            raise ValueError(f"Wrong joint count at {landmark_path}, frame {t}")
-        for j, point in enumerate(landmarks):
-            if point is None:
+        body = frame.get("landmarks")
+        if body is None:
+            if openpose_hands:
+                # Entire pose missing: leave body+hands masked for this frame.
                 continue
-            point = np.asarray(point, dtype=np.float32)
-            if point.shape != (len(fmt),) or not np.isfinite(point).all():
-                raise ValueError(f"Invalid landmark at {landmark_path}, frame {t}, joint {j}")
-            xyz[t, j] = point[xyz_columns]
-            confidence = float(point[vis_column]) if vis_column is not None else 1.0
-            if not 0 <= confidence <= 1:
-                raise ValueError(f"Visibility outside [0, 1] at frame {t}, joint {j}")
-            visibility[t, j] = confidence
-            valid[t, j] = True
+            continue
+        if not isinstance(body, list) or len(body) != body_joints:
+            raise ValueError(
+                f"Wrong body joint count at {landmark_path}, frame {t}: "
+                f"expected {body_joints}, got {0 if not isinstance(body, list) else len(body)}"
+            )
+        if openpose_hands:
+            left = _hand_joint_list(frame, "hand_left", landmark_path=landmark_path, frame_label=t)
+            right = _hand_joint_list(frame, "hand_right", landmark_path=landmark_path, frame_label=t)
+            combined = list(body) + list(left) + list(right)
+            if len(combined) != OPENPOSE_BODY_HAND_JOINTS:
+                raise ValueError(
+                    f"Internal joint concatenation error at {landmark_path}, frame {t}: "
+                    f"got {len(combined)}"
+                )
+        else:
+            combined = body
+        for j, point in enumerate(combined):
+            _store_joint(
+                xyz, visibility, valid, t, j, point,
+                fmt=fmt, xyz_columns=xyz_columns, vis_column=vis_column,
+                landmark_path=landmark_path, frame_label=t, joint_label=str(j),
+            )
     # PNGs absent from the JSON cannot be aligned reliably; report rather than drop.
     extra = {p.name for p in rgb_segment.iterdir() if p.is_file() and p.suffix.lower() == ".png"} - seen
     if extra:

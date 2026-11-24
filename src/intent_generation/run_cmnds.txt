@@ -1,6 +1,7 @@
-# Run single stage prompt training
+# Run single stage prompt training (OpenPose 67-joint landmarks; default --num-joints 67)
 nohup python train.py \
     --epochs 50 \
+    --gpu 1 \
     --bleurt-checkpoint /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/checkpoints/BLEURT-20 \
     --model-file model/pC.py \
     --output-dir runs/single/ > out.log 2>&1 &
@@ -10,12 +11,13 @@ nohup python train.py \
     --epochs 50 \
     --gpu 1 \
     --bleurt-checkpoint /home/z/zaimazarnaz/research1/Aphasia/src/intent_generation/checkpoints/BLEURT-20 \
-    --model-file model/p_A1_A2_B_C.py \
-    --output-dir runs/hierarchical_v2/ > out.log 2>&1 &
+    --model-file model/p_A1_A2_B_C_pose.py \
+    --output-dir runs/hierarchical_pose/ > out.log 2>&1 &
 
 # Compare performance between single and hierarchical prompting
 # Paths resolve under intent_generation/ (../runs/... also works after path fix).
 # hierarchical_v2 needs metrics.jsonl (after first val epoch); until then use runs/hierarchical.
 python result_analysis/performance_comparison.py \
   --single-run-dir runs/single \
-  --hierarchical-run-dir runs/hierarchical
+  --hierarchical-rgb-run-dir runs/hierarchical_rgb \
+  --hierarchical-pose-run-dir runs/hierarchical_pose
